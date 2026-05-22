@@ -1,0 +1,9 @@
+bags/*
+!bags/.gitkeep
+logs/*
+!logs/.gitkeep
+.env
+*.pyc
+__pycache__/
+.vscode/
+.idea/

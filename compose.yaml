@@ -1,0 +1,65 @@
+name: ros2-jazzy-realsense
+
+x-common: &common
+  image: localhost/ros2-jazzy-realsense:latest
+  build:
+    context: .
+    dockerfile: Containerfile
+    args:
+      ROS_DISTRO: jazzy
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  stdin_open: true
+  tty: true
+  environment:
+    ROS_DISTRO: jazzy
+    ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+    RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+    DISPLAY: ${DISPLAY:-:0}
+    WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-}
+    XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-/tmp}
+    QT_X11_NO_MITSHM: ${QT_X11_NO_MITSHM:-1}
+    LIBGL_ALWAYS_SOFTWARE: ${LIBGL_ALWAYS_SOFTWARE:-0}
+    CAMERA_NAME: ${CAMERA_NAME:-camera}
+    DEPTH_PROFILE: ${DEPTH_PROFILE:-848x480x30}
+    COLOR_PROFILE: ${COLOR_PROFILE:-1280x720x30}
+    ENABLE_POINTCLOUD: ${ENABLE_POINTCLOUD:-false}
+    ALIGN_DEPTH: ${ALIGN_DEPTH:-true}
+    ENABLE_IMU: ${ENABLE_IMU:-true}
+    UNITE_IMU_METHOD: ${UNITE_IMU_METHOD:-2}
+    ROSBAG_STORAGE: ${ROSBAG_STORAGE:-mcap}
+  volumes:
+    - /dev:/dev
+    - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    - ${XDG_RUNTIME_DIR:-/tmp}:${XDG_RUNTIME_DIR:-/tmp}:rw
+    - ./bags:/work/bags:rw
+    - ./logs:/work/logs:rw
+    - ./config:/work/config:rw
+    - ./rviz:/work/rviz:rw
+    - ./scripts:/work/scripts:rw
+    - ./odometry:/work/odometry:rw
+  working_dir: /work
+
+services:
+  shell:
+    <<: *common
+    command: bash
+
+  camera:
+    <<: *common
+    command: /work/scripts/_inside_camera_ros.sh
+
+  viewer:
+    <<: *common
+    command: realsense-viewer
+
+  rviz:
+    <<: *common
+    command: rviz2 -d /work/rviz/realsense_rgbd.rviz
+
+  rtabmap-odom:
+    <<: *common
+    profiles: ["slam"]
+    command: /work/scripts/_inside_rtabmap_rgbd_odom.sh
