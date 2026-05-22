@@ -292,7 +292,7 @@ class OdomCsvExporter:
             rosbag2_py.StorageOptions(
                 uri=str(self.out_bag),
                 storage_id="mcap",
-                storage_preset_profile="zstd_fast"
+                storage_preset_profile="zstd_small"
             ),
             rosbag2_py.ConverterOptions(
                 input_serialization_format="cdr",
