@@ -1,0 +1,33 @@
+# RealSense D435i camera calibration (1280x720)
+# Extracted from MCAP bag camera_info topic
+
+# Viewer off for headless operation
+Viewer.on: 0
+
+Camera.fx: 907.2616
+Camera.fy: 906.7314
+Camera.cx: 651.042
+Camera.cy: 370.796
+
+Camera.k1: 0.0
+Camera.k2: 0.0
+Camera.p1: 0.0
+Camera.p2: 0.0
+Camera.k3: 0.0
+
+Camera.width: 1280
+Camera.height: 720
+
+Camera.fps: 30.0
+
+# IR projector baseline times fx (D435i baseline ~0.05m)
+Camera.bf: 45.36
+
+# Color order: RGB
+Camera.RGB: 1
+
+# Close/Far threshold
+ThDepth: 8.0
+
+# Depth values from 16UC1 are in millimeters
+DepthMapFactor: 1000.0

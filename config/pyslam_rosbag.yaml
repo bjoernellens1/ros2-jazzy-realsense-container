@@ -1,0 +1,20 @@
+DATASET:
+  type: MCAP_DATASET
+
+MCAP_DATASET:
+  type: mcap
+  sensor_type: rgbd
+  base_path: /input/
+  name: input.mcap
+  settings: /work/config/pyslam_realsense_d435i.yaml
+  ros_settings:
+    sync_queue_size: 100
+    sync_slop: 0.05
+    depth_factor: 1.0
+    convert_color_rgb2bgr: false
+    topics:
+      color_image: '/camera/camera/color/image_raw'
+      depth_image: '/camera/camera/aligned_depth_to_color/image_raw'
+  groundtruth_file: ''
+  environment_type: indoor
+  fps: 30

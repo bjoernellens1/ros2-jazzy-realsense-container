@@ -1,0 +1,27 @@
+# RGB-D Visual Odometry container (Open3D + MCAP reader)
+# Ubuntu 22.04 + Python 3.11
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3.11-venv python3.11-distutils \
+    libgl1-mesa-glx libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+    numpy open3d scipy pyyaml mcap mcap-ros2-support
+
+COPY config/pyslam_realsense_d435i.yaml /work/config/pyslam_realsense_d435i.yaml
+COPY config/pyslam_rosbag.yaml /work/config/pyslam_rosbag.yaml
+COPY scripts/_inside_pyslam_vo.py /work/scripts/_inside_pyslam_vo.py
+
+WORKDIR /work
+ENTRYPOINT ["python3", "/work/scripts/_inside_pyslam_vo.py", "/work/config/pyslam_realsense_d435i.yaml"]
