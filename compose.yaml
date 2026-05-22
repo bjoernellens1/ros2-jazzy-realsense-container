@@ -77,3 +77,8 @@ services:
     <<: *common
     profiles: ["slam"]
     command: /work/scripts/_inside_rtabmap_rgbd_odom.sh
+
+  pseudo-gt:
+    <<: *common
+    profiles: ["offline"]
+    command: bash
