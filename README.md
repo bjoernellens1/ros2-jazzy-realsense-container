@@ -102,6 +102,12 @@ Open RViz2:
 ./scripts/rviz.sh
 ```
 
+Open the RTAB-Map odometry RViz profile:
+
+```bash
+./scripts/rviz_rtabmap.sh
+```
+
 Record RGB-D-IMU data:
 
 ```bash
@@ -115,15 +121,18 @@ The bag will be written under `./bags/my_room_loop_01`.
 The defaults in `config/d435i.env` are chosen for handheld room capture:
 
 ```text
-Depth: 848x480 @ 30 Hz
-Color: 1280x720 @ 30 Hz
+Depth: 640x480 @ 15 Hz
+Color: 640x480 @ 15 Hz
 Aligned depth: enabled
+Hardware reset: enabled on camera startup
 IMU: enabled
 Preset: Medium Density by default, changeable after launch
 Point cloud: disabled by default for recording
 ```
 
 Why point cloud disabled? It explodes bag size and is reproducible later from aligned depth + intrinsics.
+
+Why 15 Hz VGA by default? It is the conservative live RGB-D odometry profile for this container workflow. Higher color/depth profiles can work, but on this D435i setup they caused missing or stalled depth frames and RTAB-Map lost the `odom` frame.
 
 ## Change RealSense visual preset
 

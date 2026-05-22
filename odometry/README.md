@@ -17,6 +17,17 @@ Run:
 ./scripts/rtabmap_rgbd_odom.sh
 ```
 
+For live odometry evaluation, use the conservative default camera profile:
+
+```text
+DEPTH_PROFILE=640x480x15
+COLOR_PROFILE=640x480x15
+ALIGN_DEPTH=true
+INITIAL_RESET=true
+```
+
+This keeps raw and aligned depth publishing reliably on the tested D435i. Higher 30 Hz or 720p color profiles may publish color while depth stalls, which leaves RViz without live depth and RTAB-Map without an `odom` TF.
+
 ## Second layer: RTAB-Map full SLAM
 
 After odometry works, add full `rtabmap_launch` mapping. Keep this separate from recording so failed SLAM does not ruin raw data capture.
