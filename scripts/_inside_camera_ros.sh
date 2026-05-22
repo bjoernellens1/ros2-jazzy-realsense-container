@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 
@@ -25,4 +25,4 @@ ros2 launch realsense2_camera rs_launch.py \
   unite_imu_method:="${UNITE_IMU_METHOD}" \
   pointcloud.enable:="${ENABLE_POINTCLOUD}" \
   depth_module.profile:="${DEPTH_PROFILE}" \
-  rgb_camera.profile:="${COLOR_PROFILE}"
+  rgb_camera.color_profile:="${COLOR_PROFILE}"

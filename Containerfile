@@ -11,7 +11,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg lsb-release locales software-properties-common sudo \
-    git build-essential cmake pkg-config python3-pip python3-colcon-common-extensions \
+    git build-essential cmake pkg-config python3-pip \
     usbutils udev v4l-utils less nano vim tmux htop tree \
     mesa-utils libgl1-mesa-dri libglx-mesa0 libegl1 libxkbcommon-x11-0 \
     libxcb-xinerama0 libxcb-cursor0 libxcb-keysyms1 libxcb-image0 libxcb-render-util0 \
@@ -27,6 +27,7 @@ RUN install -m 0755 -d /etc/apt/keyrings \
        > /etc/apt/sources.list.d/ros2.list
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-colcon-common-extensions \
     ros-${ROS_DISTRO}-desktop \
     ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
     ros-${ROS_DISTRO}-image-transport-plugins \
