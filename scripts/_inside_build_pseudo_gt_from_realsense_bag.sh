@@ -109,7 +109,7 @@ echo "[pseudo-gt] Full CSV: $FULL_CSV"
     camera_name:="${CAMERA_NAME:-camera}" \
     enable_color:=true \
     enable_depth:=true \
-    enable_sync:=true \
+    enable_sync:=false \
     align_depth.enable:=true \
     initial_reset:=false \
     enable_accel:=true \
