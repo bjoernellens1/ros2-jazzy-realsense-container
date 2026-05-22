@@ -31,10 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
     ros-${ROS_DISTRO}-image-transport-plugins \
     ros-${ROS_DISTRO}-rosbag2-storage-mcap \
-    ros-${ROS_DISTRO}-realsense2-camera \
-    ros-${ROS_DISTRO}-realsense2-camera-msgs \
-    ros-${ROS_DISTRO}-realsense2-description \
-    ros-${ROS_DISTRO}-librealsense2 \
+    ros-${ROS_DISTRO}-librealsense2* \
+    ros-${ROS_DISTRO}-realsense2-* \
     ros-${ROS_DISTRO}-rtabmap-ros \
     ros-${ROS_DISTRO}-robot-localization \
     && rm -rf /var/lib/apt/lists/*

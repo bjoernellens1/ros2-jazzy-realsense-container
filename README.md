@@ -10,6 +10,8 @@ A containerized RealSense starter repo for Fedora hosts. It gives you one Compos
 
 The intended host is Fedora KDE/GNOME with Podman or Docker. The container image is Ubuntu 24.04 + ROS 2 Jazzy, because Jazzy and the official ROS packages are native there.
 
+The image follows the `realsense-ros` package pattern of installing `ros-${ROS_DISTRO}-librealsense2*` and `ros-${ROS_DISTRO}-realsense2-*`, so it should include the ROS wrapper, librealsense2 libraries, and RealSense tooling when those packages are available for Jazzy.
+
 ## Layout
 
 ```text
