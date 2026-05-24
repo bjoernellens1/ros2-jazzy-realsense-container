@@ -175,6 +175,9 @@ def rosbag_topics(path: Path) -> dict[str, str]:
 
 
 def image_to_array(msg: Any, is_depth: bool) -> np.ndarray:
+    if hasattr(msg, "format") and not hasattr(msg, "height"):
+        return compressed_image_to_array(msg, is_depth=is_depth)
+
     encoding = msg.encoding.lower()
     height = int(msg.height)
     width = int(msg.width)
@@ -209,6 +212,26 @@ def image_to_array(msg: Any, is_depth: bool) -> np.ndarray:
 
     kind = "depth" if is_depth else "color"
     raise RuntimeError(f"Unsupported {kind} image encoding: {msg.encoding}")
+
+
+def compressed_image_to_array(msg: Any, is_depth: bool) -> np.ndarray:
+    import cv2
+
+    data = np.frombuffer(msg.data, dtype=np.uint8)
+    fmt = getattr(msg, "format", "").lower()
+    if is_depth and "compresseddepth" in fmt and data.size > 12:
+        decoded = cv2.imdecode(data[12:], cv2.IMREAD_UNCHANGED)
+    else:
+        flags = cv2.IMREAD_UNCHANGED if is_depth else cv2.IMREAD_COLOR
+        decoded = cv2.imdecode(data, flags)
+    if decoded is None:
+        kind = "depth" if is_depth else "color"
+        raise RuntimeError(f"Could not decode compressed {kind} image with format '{getattr(msg, 'format', '')}'")
+    if not is_depth and decoded.ndim == 2:
+        return cv2.cvtColor(decoded, cv2.COLOR_GRAY2BGR)
+    if is_depth and decoded.ndim == 3:
+        decoded = decoded[:, :, 0]
+    return decoded.copy()
 
 
 def normalize_depth(depth: np.ndarray, depth_factor: float) -> np.ndarray:
@@ -1698,6 +1721,13 @@ def run_candidates(
     colmap_use_gpu: str,
 ) -> list[CandidateResult]:
     results = []
+    compressed_replay_topics = any(
+        topic and topic.endswith("/compressed")
+        for topic in [
+            profile.get("rgb_topics", [None])[0],
+            profile.get("depth_topics", [None])[0],
+        ]
+    )
     for method in methods:
         out_dir = workspace / "candidates" / method
         print(f"[pseudo-gt] Running candidate: {method}")
@@ -1707,6 +1737,14 @@ def run_candidates(
                 out_dir.mkdir(parents=True, exist_ok=True)
                 log.write_text("RTAB-Map candidates require ROS bag playback; skipped for TUM RGB-D input.\n", encoding="utf-8")
                 result = CandidateResult(method, "failed", None, log, {}, "requires ROS bag playback")
+            elif compressed_replay_topics:
+                log = out_dir / "run.log"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                log.write_text(
+                    "RTAB-Map RGB-D odometry expects raw Image topics; skipped because selected bag topics are compressed.\n",
+                    encoding="utf-8",
+                )
+                result = CandidateResult(method, "failed", None, log, {}, "requires raw Image topics")
             else:
                 result = run_rtabmap_candidate(method, bag, out_dir, profile)
         elif method == "colmap_sfm":

@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -102,3 +103,20 @@ def test_tum_rgbd_sequence_normalizes_to_common_layout(tmp_path: Path) -> None:
     info = __import__("json").loads((dataset / "camera_info.json").read_text(encoding="utf-8"))
     assert info["fx"] == 517.3
     assert info["depth_factor"] == 5000.0
+
+
+def test_compressed_image_decode_supports_rgb_and_depth() -> None:
+    cv2 = __import__("pytest").importorskip("cv2")
+
+    color = np.full((8, 10, 3), (10, 20, 30), dtype=np.uint8)
+    ok, encoded_color = cv2.imencode(".png", color)
+    assert ok
+    decoded_color = pg.image_to_array(SimpleNamespace(format="png", data=encoded_color.tobytes()), is_depth=False)
+    assert decoded_color.shape == color.shape
+
+    depth = np.full((8, 10), 1234, dtype=np.uint16)
+    ok, encoded_depth = cv2.imencode(".png", depth)
+    assert ok
+    decoded_depth = pg.image_to_array(SimpleNamespace(format="16UC1; compressed png", data=encoded_depth.tobytes()), is_depth=True)
+    assert decoded_depth.dtype == np.uint16
+    assert int(decoded_depth[0, 0]) == 1234

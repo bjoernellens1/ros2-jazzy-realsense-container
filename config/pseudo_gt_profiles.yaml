@@ -31,9 +31,12 @@ profiles:
     frame_id: camera_link
     rgb_topics:
       - /camera/camera/color/image_raw
+      - /camera/camera/color/image_raw/compressed
     depth_topics:
       - /camera/camera/aligned_depth_to_color/image_raw
       - /camera/camera/depth/image_rect_raw
+      - /camera/camera/aligned_depth_to_color/image_raw/compressed
+      - /camera/camera/depth/image_rect_raw/compressed
     raw_depth_topics:
       - /camera/camera/depth/image_rect_raw
     camera_info_topics:
@@ -53,15 +56,19 @@ profiles:
     frame_id: camera_link
     rgb_topics:
       - /camera/color/image_raw
+      - /camera/color/image_raw/compressed
       - /camera/color/image
       - /camera/rgb/image_raw
       - /camera/camera/color/image_raw
+      - /camera/camera/color/image_raw/compressed
     depth_topics:
       - /camera/depth_registered/image_raw
       - /camera/aligned_depth_to_color/image_raw
       - /camera/depth/image_raw
+      - /camera/depth/image_raw/compressed
       - /camera/depth/image
       - /camera/camera/aligned_depth_to_color/image_raw
+      - /camera/camera/aligned_depth_to_color/image_raw/compressed
     raw_depth_topics:
       - /camera/depth/image_raw
       - /camera/depth/image
