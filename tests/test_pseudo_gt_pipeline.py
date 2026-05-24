@@ -120,3 +120,27 @@ def test_compressed_image_decode_supports_rgb_and_depth() -> None:
     decoded_depth = pg.image_to_array(SimpleNamespace(format="16UC1; compressed png", data=encoded_depth.tobytes()), is_depth=True)
     assert decoded_depth.dtype == np.uint16
     assert int(decoded_depth[0, 0]) == 1234
+
+
+def test_stream_association_is_one_to_one_and_reports_sync() -> None:
+    left = [(0, "a"), (10, "b"), (20, "c")]
+    right = [(1, "d0"), (11, "d1")]
+    assignments = pg.associate_streams_by_stamp(left, right, max_delta_ns=3)
+    assert assignments == [(0, 0), (1, 1)]
+
+    report = pg.build_sync_report(
+        "/rgb",
+        "/depth",
+        "/info",
+        raw_color_count=len(left),
+        raw_depth_count=len(right),
+        raw_info_count=1,
+        assignments=assignments,
+        colors=left,
+        depths=right,
+        max_delta_ns=3,
+        profile={"min_association_ratio": 0.5},
+    )
+    assert report["status"] == "ok"
+    assert report["association_ratio"] == 2 / 3
+    assert report["max_abs_dt_sec"] == 1e-09

@@ -23,6 +23,7 @@ profiles:
       - /camera/camera/imu
       - /camera/camera/accel/sample
     association_max_dt: 0.05
+    min_association_ratio: 0.8
     depth_factor: 1000.0
 
   realsense_d435i_ros2:
@@ -48,6 +49,7 @@ profiles:
       - /camera/camera/imu
       - /camera/camera/accel/sample
     association_max_dt: 0.05
+    min_association_ratio: 0.8
     depth_factor: 1000.0
 
   orbbec_femto_bolt_ros2:
@@ -88,4 +90,5 @@ profiles:
       - /camera/gyro/sample
       - /camera/camera/imu
     association_max_dt: 0.05
+    min_association_ratio: 0.8
     depth_factor: 1000.0

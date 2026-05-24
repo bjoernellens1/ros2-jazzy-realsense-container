@@ -233,6 +233,10 @@ run_manifest.json
 
 Reliability is agreement-gated. At least two healthy methods must agree with the moderate default gate before `best_pseudo_gt_tum.csv` is written. If no pair agrees, the run exits nonzero, writes diagnostics, and does not call the result reliable. Use `--allow-unreliable-best` only when you explicitly want a low-confidence fallback file named `candidate_best_unreliable_tum.csv`.
 
+For rosbags, extraction first performs one-to-one RGB/depth timestamp association from message header stamps, with bag timestamp fallback only if headers are missing. The default profiles require at least 80% of color frames to associate within `association_max_dt: 0.05`; sync diagnostics are written to `diagnostics/sync_report.json`.
+
+Every run prints `[progress]` lines with estimated percent complete, elapsed time, and ETA for normalization, each candidate method, agreement scoring, and output persistence. Long external commands also emit periodic progress pulses while the command is still running.
+
 Use `--persist-intermediates` to copy the normalized dataset and scratch workspace to disk for debugging. Use `PSEUDO_GT_SHM_SIZE=64gb` with Compose if the default shared-memory workspace is too small.
 
 ## Notes for Gaussian Splatting capture

@@ -90,16 +90,131 @@ class CandidateResult:
     reason: str = ""
 
 
-def run(cmd: list[str], log: Path | None = None, env: dict[str, str] | None = None, cwd: Path | None = None) -> int:
+@dataclass
+class ProgressStep:
+    name: str
+    weight: float
+    expected_sec: float
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{sec:02d}s"
+    return f"{minutes:d}m{sec:02d}s"
+
+
+class ProgressReporter:
+    def __init__(self, steps: list[ProgressStep], interval_sec: float = 20.0) -> None:
+        self.steps = {step.name: step for step in steps}
+        self.total_weight = sum(step.weight for step in steps) or 1.0
+        self.total_expected = sum(step.expected_sec for step in steps)
+        self.completed_weight = 0.0
+        self.completed_steps: set[str] = set()
+        self.active_name: str | None = None
+        self.active_started = time.monotonic()
+        self.started = time.monotonic()
+        self.last_emit = 0.0
+        self.interval_sec = interval_sec
+
+    def start(self, name: str) -> None:
+        self.active_name = name
+        self.active_started = time.monotonic()
+        self.emit("start", name, force=True)
+
+    def done(self, name: str) -> None:
+        if name not in self.completed_steps:
+            self.completed_steps.add(name)
+            self.completed_weight += self.steps.get(name, ProgressStep(name, 0.0, 0.0)).weight
+        if self.active_name == name:
+            self.active_name = None
+        self.emit("done", name, force=True)
+
+    def fail(self, name: str) -> None:
+        self.emit("failed", name, force=True)
+
+    def pulse(self, label: str | None = None) -> None:
+        self.emit("running", label or self.active_name or "pipeline", force=False)
+
+    def fraction(self) -> float:
+        weight = self.completed_weight
+        if self.active_name and self.active_name not in self.completed_steps:
+            step = self.steps.get(self.active_name)
+            if step:
+                elapsed_active = time.monotonic() - self.active_started
+                active_fraction = min(0.90, elapsed_active / max(step.expected_sec, 1.0))
+                weight += step.weight * active_fraction
+        return min(0.999, max(0.001, weight / self.total_weight))
+
+    def eta_sec(self, fraction: float) -> float:
+        elapsed = time.monotonic() - self.started
+        if fraction > 0.01:
+            return elapsed * (1.0 - fraction) / fraction
+        return max(0.0, self.total_expected - elapsed)
+
+    def emit(self, status: str, label: str, force: bool) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_emit < self.interval_sec:
+            return
+        self.last_emit = now
+        fraction = self.fraction()
+        elapsed = now - self.started
+        eta = self.eta_sec(fraction)
+        print(
+            f"[progress] {fraction * 100:5.1f}% stage={label} status={status} "
+            f"elapsed={format_duration(elapsed)} eta={format_duration(eta)}",
+            flush=True,
+        )
+
+
+def make_progress_reporter(methods: list[str]) -> ProgressReporter:
+    candidate_weight = 0.60 / max(1, len(methods))
+    candidate_expected = {
+        "rtabmap_rgbd": 180.0,
+        "rtabmap_rgbd_imu": 180.0,
+        "colmap_sfm": 120.0,
+        "orbslam3_rgbd": 90.0,
+    }
+    steps = [ProgressStep("normalize_input", 0.25, 90.0)]
+    for method in methods:
+        steps.append(ProgressStep(f"candidate:{method}", candidate_weight, candidate_expected.get(method, 120.0)))
+    steps.extend(
+        [
+            ProgressStep("agreement", 0.10, 10.0),
+            ProgressStep("persist_outputs", 0.05, 5.0),
+        ]
+    )
+    return ProgressReporter(steps)
+
+
+def run(
+    cmd: list[str],
+    log: Path | None = None,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+    progress: ProgressReporter | None = None,
+    progress_label: str | None = None,
+) -> int:
     if log is None:
-        return subprocess.run(cmd, env=env, cwd=cwd, check=False).returncode
+        proc = subprocess.Popen(cmd, env=env, cwd=cwd)
+        while proc.poll() is None:
+            if progress is not None:
+                progress.pulse(progress_label or Path(cmd[0]).name)
+            time.sleep(1.0)
+        return int(proc.returncode)
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
         fh.write("+ " + " ".join(cmd) + "\n")
         fh.flush()
-        proc = subprocess.run(cmd, env=env, cwd=cwd, stdout=fh, stderr=subprocess.STDOUT, check=False)
+        proc = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=fh, stderr=subprocess.STDOUT, text=True)
+        while proc.poll() is None:
+            if progress is not None:
+                progress.pulse(progress_label or Path(cmd[0]).name)
+            time.sleep(1.0)
         fh.write(f"[exit] {proc.returncode}\n")
-        return proc.returncode
+        return int(proc.returncode)
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -134,6 +249,111 @@ def choose_topic(available: set[str], candidates: list[str], required: bool = Tr
     if required:
         raise RuntimeError(f"None of the topic candidates were found: {', '.join(candidates)}")
     return None
+
+
+def associate_streams_by_stamp(
+    left: list[tuple[int, Any]],
+    right: list[tuple[int, Any]],
+    max_delta_ns: int,
+) -> list[tuple[int, int]]:
+    right_times = [item[0] for item in right]
+    candidates = []
+    for left_idx, (left_ns, _) in enumerate(left):
+        idx = bisect.bisect_left(right_times, left_ns)
+        for right_idx in {idx - 1, idx}:
+            if 0 <= right_idx < len(right):
+                delta = abs(right[right_idx][0] - left_ns)
+                if delta <= max_delta_ns:
+                    candidates.append((delta, left_idx, right_idx))
+
+    assigned_left: set[int] = set()
+    assigned_right: set[int] = set()
+    assignments = []
+    for delta, left_idx, right_idx in sorted(candidates, key=lambda item: item[0]):
+        if left_idx in assigned_left or right_idx in assigned_right:
+            continue
+        assigned_left.add(left_idx)
+        assigned_right.add(right_idx)
+        assignments.append((left_idx, right_idx))
+    assignments.sort(key=lambda item: item[0])
+    return assignments
+
+
+def nearest_message_by_stamp(stream: list[tuple[int, Any]], stamp_ns_value: int) -> Any:
+    if not stream:
+        raise RuntimeError("Cannot select nearest message from an empty stream")
+    times = [item[0] for item in stream]
+    idx = bisect.bisect_left(times, stamp_ns_value)
+    choices = []
+    if idx < len(stream):
+        choices.append(stream[idx])
+    if idx > 0:
+        choices.append(stream[idx - 1])
+    return min(choices, key=lambda item: abs(item[0] - stamp_ns_value))[1]
+
+
+def sync_delta_stats(deltas_sec: list[float]) -> dict[str, Any]:
+    if not deltas_sec:
+        return {"count": 0}
+    arr = np.asarray(deltas_sec, dtype=float)
+    return {
+        "count": int(arr.size),
+        "min_abs_dt_sec": float(np.min(arr)),
+        "median_abs_dt_sec": float(np.median(arr)),
+        "p95_abs_dt_sec": float(np.percentile(arr, 95)),
+        "max_abs_dt_sec": float(np.max(arr)),
+    }
+
+
+def build_sync_report(
+    rgb_topic: str,
+    depth_topic: str,
+    info_topic: str,
+    raw_color_count: int,
+    raw_depth_count: int,
+    raw_info_count: int,
+    assignments: list[tuple[int, int]],
+    colors: list[tuple[int, Any]],
+    depths: list[tuple[int, Any]],
+    max_delta_ns: int,
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    deltas = [abs(colors[color_idx][0] - depths[depth_idx][0]) / 1e9 for color_idx, depth_idx in assignments]
+    association_ratio = len(assignments) / raw_color_count if raw_color_count else 0.0
+    min_ratio = float(profile.get("min_association_ratio", 0.8))
+    status = "ok"
+    reasons = []
+    if not assignments:
+        status = "failed"
+        reasons.append("no_rgb_depth_pairs")
+    if association_ratio < min_ratio:
+        status = "failed"
+        reasons.append(f"association_ratio_below_{min_ratio:g}")
+    stats = sync_delta_stats(deltas)
+    return {
+        "status": status,
+        "reasons": reasons,
+        "rgb_topic": rgb_topic,
+        "depth_topic": depth_topic,
+        "camera_info_topic": info_topic,
+        "raw_color_count": raw_color_count,
+        "raw_depth_count": raw_depth_count,
+        "raw_camera_info_count": raw_info_count,
+        "associated_count": len(assignments),
+        "dropped_color_count": max(0, raw_color_count - len(assignments)),
+        "association_ratio": association_ratio,
+        "max_allowed_dt_sec": max_delta_ns / 1e9,
+        **stats,
+        "policy": {
+            "one_to_one_depth_assignment": True,
+            "timestamp_source": "message header stamp with bag timestamp fallback",
+            "min_association_ratio": min_ratio,
+        },
+    }
+
+
+def write_sync_report(dataset: Path, report: dict[str, Any]) -> None:
+    (dataset / "sync_report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def stamp_to_ns(stamp: Any) -> int:
@@ -506,23 +726,42 @@ def extract_ros2_bag(
     colors.sort(key=lambda item: item[0])
     depths.sort(key=lambda item: item[0])
     infos.sort(key=lambda item: item[0])
-    depth_times = [item[0] for item in depths]
-    info_msg = infos[0][1]
     max_delta_ns = int(float(profile.get("association_max_dt", 0.05)) * 1_000_000_000)
+    assignments = associate_streams_by_stamp(colors, depths, max_delta_ns)
+    sync_report = build_sync_report(
+        rgb_topic,
+        depth_topic,
+        info_topic,
+        raw_color_count=len(colors),
+        raw_depth_count=len(depths),
+        raw_info_count=len(infos),
+        assignments=assignments,
+        colors=colors,
+        depths=depths,
+        max_delta_ns=max_delta_ns,
+        profile=profile,
+    )
+    write_sync_report(dataset, sync_report)
+    if sync_report["status"] != "ok":
+        raise RuntimeError(
+            "ROS bag RGB-D sync failed: "
+            + ", ".join(sync_report.get("reasons", []))
+            + f" ({sync_report['associated_count']}/{sync_report['raw_color_count']} color frames associated)"
+        )
+    print(
+        "[pseudo-gt] Sync ok: "
+        f"{sync_report['associated_count']}/{sync_report['raw_color_count']} RGB frames associated, "
+        f"median_dt={sync_report.get('median_abs_dt_sec', 0.0):.6f}s, "
+        f"max_dt={sync_report.get('max_abs_dt_sec', 0.0):.6f}s",
+        flush=True,
+    )
     pairs: list[tuple[int, Any, int, Any, Any]] = []
 
-    for color_ns, color_msg in colors:
-        idx = bisect.bisect_left(depth_times, color_ns)
-        choices = []
-        if idx < len(depths):
-            choices.append(depths[idx])
-        if idx > 0:
-            choices.append(depths[idx - 1])
-        if not choices:
-            continue
-        depth_ns, depth_msg = min(choices, key=lambda item: abs(item[0] - color_ns))
-        if abs(depth_ns - color_ns) <= max_delta_ns:
-            pairs.append((color_ns, color_msg, depth_ns, depth_msg, info_msg))
+    for color_idx, depth_idx in assignments:
+        color_ns, color_msg = colors[color_idx]
+        depth_ns, depth_msg = depths[depth_idx]
+        info_msg = nearest_message_by_stamp(infos, color_ns)
+        pairs.append((color_ns, color_msg, depth_ns, depth_msg, info_msg))
 
     result = write_frames(
         pairs,
@@ -539,7 +778,9 @@ def extract_ros2_bag(
             "imu_topic": choose_topic(available, profile.get("imu_topics", []), required=False),
             "raw_color_count": len(colors),
             "raw_depth_count": len(depths),
+            "raw_camera_info_count": len(infos),
             "associated_count": len(pairs),
+            "sync": sync_report,
         }
     )
     return result
@@ -1031,6 +1272,7 @@ def run_rtabmap_candidate(
     bag: Path,
     out_dir: Path,
     profile: dict[str, Any],
+    progress: ProgressReporter | None = None,
 ) -> CandidateResult:
     subscribe_imu = method == "rtabmap_rgbd_imu"
     log = out_dir / "run.log"
@@ -1088,7 +1330,7 @@ def run_rtabmap_candidate(
             "--idle-timeout",
             "15",
         ]
-        rc = run(record_cmd, log=log)
+        rc = run(record_cmd, log=log, progress=progress, progress_label=f"{method}:record_odom")
         if rc != 0 or not tum.exists() or tum.stat().st_size == 0:
             return CandidateResult(method, "failed", None, log, {}, "rtabmap did not produce odometry")
         return CandidateResult(method, "ok", tum, log, {"subscribe_imu": subscribe_imu})
@@ -1268,6 +1510,7 @@ def run_colmap_candidate(
     out_dir: Path,
     preset: str,
     use_gpu: str,
+    progress: ProgressReporter | None = None,
 ) -> CandidateResult:
     method = "colmap_sfm"
     log = out_dir / "run.log"
@@ -1328,7 +1571,7 @@ def run_colmap_candidate(
             "0",
         ]
         for cmd in (feature_cmd, match_cmd, mapper_cmd):
-            rc = run(cmd, log=log)
+            rc = run(cmd, log=log, progress=progress, progress_label=f"colmap_sfm:{cmd[1]}")
             if rc != 0:
                 return CandidateResult(method, "failed", None, log, {}, f"COLMAP command failed: {cmd[1]}")
         sparse_txt = convert_colmap_models_to_text(sparse, out_dir / "sparse_txt", log)
@@ -1398,7 +1641,11 @@ def write_orbslam3_settings(dataset: Path, out_dir: Path) -> Path:
     return settings
 
 
-def run_orbslam3_candidate(dataset: Path, out_dir: Path) -> CandidateResult:
+def run_orbslam3_candidate(
+    dataset: Path,
+    out_dir: Path,
+    progress: ProgressReporter | None = None,
+) -> CandidateResult:
     method = "orbslam3_rgbd"
     log = out_dir / "run.log"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1411,7 +1658,7 @@ def run_orbslam3_candidate(dataset: Path, out_dir: Path) -> CandidateResult:
         return CandidateResult(method, "failed", None, log, {}, f"ORB-SLAM3 vocabulary not found: {vocab}")
     settings = write_orbslam3_settings(dataset, out_dir)
     cmd = [str(binary), str(vocab), str(settings), str(dataset), str(dataset / "associations.txt")]
-    rc = run(cmd, log=log, cwd=out_dir)
+    rc = run(cmd, log=log, cwd=out_dir, progress=progress, progress_label="orbslam3_rgbd:track")
     for candidate in (out_dir / "CameraTrajectory.txt", out_dir / "KeyFrameTrajectory.txt"):
         if candidate.exists() and candidate.stat().st_size > 0:
             shutil.copy2(candidate, tum)
@@ -1753,6 +2000,9 @@ def persist_outputs(
             dest = output / "diagnostics" / item.name
             if item.is_file():
                 shutil.copy2(item, dest)
+    for item in (workspace / "extraction_manifest.json", workspace / "dataset" / "sync_report.json"):
+        if item.exists():
+            shutil.copy2(item, output / "diagnostics" / item.name)
 
     winner = agreement.get("winner")
     if agreement.get("status") == "ok" and winner:
@@ -1783,6 +2033,7 @@ def run_candidates(
     profile: dict[str, Any],
     colmap_preset: str,
     colmap_use_gpu: str,
+    progress: ProgressReporter | None = None,
 ) -> list[CandidateResult]:
     results = []
     compressed_replay_topics = any(
@@ -1794,6 +2045,8 @@ def run_candidates(
     )
     for method in methods:
         out_dir = workspace / "candidates" / method
+        if progress is not None:
+            progress.start(f"candidate:{method}")
         print(f"[pseudo-gt] Running candidate: {method}")
         if method in {"rtabmap_rgbd", "rtabmap_rgbd_imu"}:
             if profile.get("input_format") == "tum_rgbd":
@@ -1810,14 +2063,16 @@ def run_candidates(
                 )
                 result = CandidateResult(method, "failed", None, log, {}, "requires raw Image topics")
             else:
-                result = run_rtabmap_candidate(method, bag, out_dir, profile)
+                result = run_rtabmap_candidate(method, bag, out_dir, profile, progress=progress)
         elif method == "colmap_sfm":
-            result = run_colmap_candidate(dataset, out_dir, colmap_preset, colmap_use_gpu)
+            result = run_colmap_candidate(dataset, out_dir, colmap_preset, colmap_use_gpu, progress=progress)
         elif method == "orbslam3_rgbd":
-            result = run_orbslam3_candidate(dataset, out_dir)
+            result = run_orbslam3_candidate(dataset, out_dir, progress=progress)
         else:
             result = CandidateResult(method, "failed", None, None, {}, "unknown method")
         print(f"[pseudo-gt] {method}: {result.status} {result.reason}")
+        if progress is not None:
+            progress.done(f"candidate:{method}")
         results.append(result)
     return results
 
@@ -1861,6 +2116,7 @@ def main() -> int:
     profile = load_profile(args.profile_config, args.profile)
     input_format = detect_input_format(bag, args.input_format, profile)
     profile["input_format"] = input_format
+    progress = make_progress_reporter(methods)
     ensure_empty_output(output, args.force)
     workspace = make_workspace(output, args.workspace_mode, args.keep_workspace)
     print(f"[pseudo-gt] Workspace: {workspace}")
@@ -1869,6 +2125,7 @@ def main() -> int:
 
     try:
         dataset = workspace / "dataset"
+        progress.start("normalize_input")
         extraction = normalize_input(
             bag,
             dataset,
@@ -1878,6 +2135,7 @@ def main() -> int:
             max_frames=args.max_frames,
             log_dir=workspace / "logs",
         )
+        progress.done("normalize_input")
         if extraction.get("rgb_topic"):
             profile["rgb_topics"] = [extraction["rgb_topic"]]
         if extraction.get("depth_topic"):
@@ -1895,13 +2153,22 @@ def main() -> int:
             profile,
             colmap_preset=args.colmap_preset,
             colmap_use_gpu=args.colmap_use_gpu,
+            progress=progress,
         )
+        progress.start("agreement")
         agreement = evaluate_agreement(results, workspace / "diagnostics", args.allow_unreliable_best)
+        progress.done("agreement")
+        progress.start("persist_outputs")
         persist_outputs(workspace, output, results, agreement, args.persist_intermediates)
+        progress.done("persist_outputs")
         if agreement.get("status") != "ok" and not args.allow_unreliable_best:
             print("[pseudo-gt] Agreement failed; no reliable best_pseudo_gt_tum.csv was written.", file=sys.stderr)
             return 3
         return 0
+    except Exception:
+        if progress.active_name is not None:
+            progress.fail(progress.active_name)
+        raise
     finally:
         cleanup_workspace(workspace, args.keep_workspace)
 
