@@ -110,6 +110,12 @@ services:
     profiles: ["offline"]
     command: bash
 
+  pyslam-vo:
+    <<: *common
+    image: localhost/ros2-jazzy-pyslam:latest
+    profiles: ["offline"]
+    command: python3 /work/scripts/_inside_pyslam_vo.py /work/config/pyslam_realsense_d435i.yaml
+
   pseudo-gt-cuda:
     <<: *pseudo-gt-cuda
     profiles: ["cuda"]

@@ -1,15 +1,62 @@
+# Local host/runtime config
+.env
+*.env.local
+
+# ROS/RealSense captures and bag stores. These can be huge and may contain
+# private lab/video data; keep them out of the public repo even if copied
+# outside ./bags by mistake.
+*.bag
+*.mcap
+*.db3
+*.sqlite
+*.sqlite3
+*.active
 bags/*
 !bags/.gitkeep
+
+# Runtime logs and generated odometry artifacts
 logs/*
 !logs/.gitkeep
 odometry/*
 !odometry/README.md
-.env
-*.pyc
-__pycache__/
-.vscode/
-.idea/
+
+# Pseudo-GT / COLMAP / ORB-SLAM scratch and result bundles
 *_pseudo_gt/
 *_pseudo_gt_*/
+pseudo_gt_smoke/
 _workspace/
+dataset/
+datasets/
+outputs/
+candidates/
+diagnostics/
+sparse/
+sparse_txt/
+stereo/
+database.db
+**/database.db
+**/best_pseudo_gt_tum.csv
+**/candidate_best_unreliable_tum.csv
+**/run_manifest.json
+**/extraction_manifest.json
+**/sync_report.json
+**/frames.csv
+**/quality.csv
+**/associations.txt
+
+# Large derived numerical/geometry/media artifacts
+*.npy
+*.npz
+*.ply
+*.pcd
+*.tar
+*.tgz
+*.zip
+*.7z
+
+# Editor / Python / test residue
+*.pyc
+__pycache__/
 .pytest_cache/
+.vscode/
+.idea/
