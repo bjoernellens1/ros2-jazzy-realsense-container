@@ -101,7 +101,7 @@ def test_tum_rgbd_sequence_normalizes_to_common_layout(tmp_path: Path) -> None:
     assert (dataset / "depth" / "frame_000000.png").exists()
     assert (dataset / "associations.txt").read_text(encoding="utf-8").count("\n") == 2
     info = __import__("json").loads((dataset / "camera_info.json").read_text(encoding="utf-8"))
-    assert info["fx"] == 517.3
+    assert abs(info["fx"] - 517.306408) < 1e-6
     assert info["depth_factor"] == 5000.0
 
 

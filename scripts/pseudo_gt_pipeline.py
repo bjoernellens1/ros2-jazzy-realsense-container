@@ -23,12 +23,60 @@ import numpy as np
 DEFAULT_METHODS = "rtabmap_rgbd,rtabmap_rgbd_imu,colmap_sfm,orbslam3_rgbd"
 VALID_METHODS = {"rtabmap_rgbd", "rtabmap_rgbd_imu", "colmap_sfm", "orbslam3_rgbd"}
 TUM_FREIBURG_INTRINSICS = {
-    "freiburg1": {"fx": 517.3, "fy": 516.5, "cx": 318.6, "cy": 255.3},
-    "fr1": {"fx": 517.3, "fy": 516.5, "cx": 318.6, "cy": 255.3},
-    "freiburg2": {"fx": 520.9, "fy": 521.0, "cx": 325.1, "cy": 249.7},
-    "fr2": {"fx": 520.9, "fy": 521.0, "cx": 325.1, "cy": 249.7},
-    "freiburg3": {"fx": 535.4, "fy": 539.2, "cx": 320.1, "cy": 247.6},
-    "fr3": {"fx": 535.4, "fy": 539.2, "cx": 320.1, "cy": 247.6},
+    "freiburg1": {
+        "fx": 517.306408,
+        "fy": 516.469215,
+        "cx": 318.643040,
+        "cy": 255.313989,
+        "d": [0.262383, -0.953104, -0.005358, 0.002628, 1.163314],
+        "depth_factor": 5000.0,
+        "stereo_b": 0.07732,
+    },
+    "fr1": {
+        "fx": 517.306408,
+        "fy": 516.469215,
+        "cx": 318.643040,
+        "cy": 255.313989,
+        "d": [0.262383, -0.953104, -0.005358, 0.002628, 1.163314],
+        "depth_factor": 5000.0,
+        "stereo_b": 0.07732,
+    },
+    "freiburg2": {
+        "fx": 520.908620,
+        "fy": 521.007327,
+        "cx": 325.141442,
+        "cy": 249.701764,
+        "d": [0.231222, -0.784899, -0.003257, -0.000105, 0.917205],
+        "depth_factor": 5208.0,
+        "stereo_b": 0.0767,
+    },
+    "fr2": {
+        "fx": 520.908620,
+        "fy": 521.007327,
+        "cx": 325.141442,
+        "cy": 249.701764,
+        "d": [0.231222, -0.784899, -0.003257, -0.000105, 0.917205],
+        "depth_factor": 5208.0,
+        "stereo_b": 0.0767,
+    },
+    "freiburg3": {
+        "fx": 535.4,
+        "fy": 539.2,
+        "cx": 320.1,
+        "cy": 247.6,
+        "d": [0.0, 0.0, 0.0, 0.0, 0.0],
+        "depth_factor": 5000.0,
+        "stereo_b": 0.0747,
+    },
+    "fr3": {
+        "fx": 535.4,
+        "fy": 539.2,
+        "cx": 320.1,
+        "cy": 247.6,
+        "d": [0.0, 0.0, 0.0, 0.0, 0.0],
+        "depth_factor": 5000.0,
+        "stereo_b": 0.0747,
+    },
 }
 
 
@@ -1300,27 +1348,33 @@ def write_orbslam3_settings(dataset: Path, out_dir: Path) -> Path:
     width = int(camera_info.get("width", 640))
     height = int(camera_info.get("height", 480))
     depth_factor = float(camera_info.get("depth_factor", 1000.0))
+    distortion = [float(v) for v in camera_info.get("d", [])]
+    while len(distortion) < 5:
+        distortion.append(0.0)
+    stereo_b = float(camera_info.get("stereo_b", 0.07732))
     settings = out_dir / "orbslam3_rgbd.yaml"
     settings.write_text(
         "\n".join(
             [
                 "%YAML:1.0",
-                f"Camera.fx: {fx}",
-                f"Camera.fy: {fy}",
-                f"Camera.cx: {cx}",
-                f"Camera.cy: {cy}",
-                "Camera.k1: 0.0",
-                "Camera.k2: 0.0",
-                "Camera.p1: 0.0",
-                "Camera.p2: 0.0",
-                "Camera.k3: 0.0",
+                'File.version: "1.0"',
+                'Camera.type: "PinHole"',
+                f"Camera1.fx: {fx}",
+                f"Camera1.fy: {fy}",
+                f"Camera1.cx: {cx}",
+                f"Camera1.cy: {cy}",
+                f"Camera1.k1: {distortion[0]}",
+                f"Camera1.k2: {distortion[1]}",
+                f"Camera1.p1: {distortion[2]}",
+                f"Camera1.p2: {distortion[3]}",
+                f"Camera1.k3: {distortion[4]}",
                 f"Camera.width: {width}",
                 f"Camera.height: {height}",
                 "Camera.fps: 30.0",
-                "Camera.bf: 40.0",
                 "Camera.RGB: 1",
-                "ThDepth: 8.0",
-                f"DepthMapFactor: {depth_factor}",
+                "Stereo.ThDepth: 40.0",
+                f"Stereo.b: {stereo_b}",
+                f"RGBD.DepthMapFactor: {depth_factor}",
                 "ORBextractor.nFeatures: 1000",
                 "ORBextractor.scaleFactor: 1.2",
                 "ORBextractor.nLevels: 8",
