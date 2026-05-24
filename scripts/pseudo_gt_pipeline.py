@@ -1066,7 +1066,7 @@ def colmap_preset_args(preset: str) -> tuple[list[str], list[str]]:
     if preset == "fast":
         return (
             [
-                "--FeatureExtraction.max_image_size",
+                "--SiftExtraction.max_image_size",
                 "960",
                 "--SiftExtraction.max_num_features",
                 "4096",
@@ -1076,7 +1076,7 @@ def colmap_preset_args(preset: str) -> tuple[list[str], list[str]]:
     if preset == "robust":
         return (
             [
-                "--FeatureExtraction.max_image_size",
+                "--SiftExtraction.max_image_size",
                 "1600",
                 "--SiftExtraction.max_num_features",
                 "12000",
@@ -1098,7 +1098,7 @@ def colmap_preset_args(preset: str) -> tuple[list[str], list[str]]:
         )
     return (
         [
-            "--FeatureExtraction.max_image_size",
+            "--SiftExtraction.max_image_size",
             "1280",
             "--SiftExtraction.max_num_features",
             "8192",
@@ -1248,7 +1248,7 @@ def run_colmap_candidate(
             "1",
             "--ImageReader.camera_params",
             f"{fx},{fy},{cx},{cy}",
-            "--FeatureExtraction.use_gpu",
+            "--SiftExtraction.use_gpu",
             gpu_flag,
             *feature_args,
         ]
@@ -1257,9 +1257,9 @@ def run_colmap_candidate(
             "sequential_matcher",
             "--database_path",
             str(database),
-            "--FeatureMatching.guided_matching",
+            "--SiftMatching.guided_matching",
             "1",
-            "--FeatureMatching.use_gpu",
+            "--SiftMatching.use_gpu",
             gpu_flag,
             *matching_args,
         ]
@@ -1326,6 +1326,16 @@ def write_orbslam3_settings(dataset: Path, out_dir: Path) -> Path:
                 "ORBextractor.nLevels: 8",
                 "ORBextractor.iniThFAST: 20",
                 "ORBextractor.minThFAST: 7",
+                "Viewer.KeyFrameSize: 0.05",
+                "Viewer.KeyFrameLineWidth: 1.0",
+                "Viewer.GraphLineWidth: 0.9",
+                "Viewer.PointSize: 2.0",
+                "Viewer.CameraSize: 0.08",
+                "Viewer.CameraLineWidth: 3.0",
+                "Viewer.ViewpointX: 0.0",
+                "Viewer.ViewpointY: -0.7",
+                "Viewer.ViewpointZ: -1.8",
+                "Viewer.ViewpointF: 500.0",
                 "",
             ]
         ),
