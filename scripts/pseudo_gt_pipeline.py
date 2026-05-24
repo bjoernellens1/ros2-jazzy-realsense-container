@@ -1412,12 +1412,12 @@ def run_orbslam3_candidate(dataset: Path, out_dir: Path) -> CandidateResult:
     settings = write_orbslam3_settings(dataset, out_dir)
     cmd = [str(binary), str(vocab), str(settings), str(dataset), str(dataset / "associations.txt")]
     rc = run(cmd, log=log, cwd=out_dir)
-    if rc != 0:
-        return CandidateResult(method, "failed", None, log, {}, "ORB-SLAM3 command failed")
     for candidate in (out_dir / "CameraTrajectory.txt", out_dir / "KeyFrameTrajectory.txt"):
         if candidate.exists() and candidate.stat().st_size > 0:
             shutil.copy2(candidate, tum)
-            return CandidateResult(method, "ok", tum, log, {"source": candidate.name})
+            return CandidateResult(method, "ok", tum, log, {"source": candidate.name, "exit_code": rc})
+    if rc != 0:
+        return CandidateResult(method, "failed", None, log, {"exit_code": rc}, "ORB-SLAM3 command failed")
     return CandidateResult(method, "failed", None, log, {}, "ORB-SLAM3 did not write a trajectory")
 
 
