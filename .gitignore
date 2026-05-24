@@ -2,8 +2,14 @@ bags/*
 !bags/.gitkeep
 logs/*
 !logs/.gitkeep
+odometry/*
+!odometry/README.md
 .env
 *.pyc
 __pycache__/
 .vscode/
 .idea/
+*_pseudo_gt/
+*_pseudo_gt_*/
+_workspace/
+.pytest_cache/

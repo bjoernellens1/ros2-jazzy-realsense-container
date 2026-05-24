@@ -1,0 +1,37 @@
+ARG BASE_IMAGE=localhost/ros2-jazzy-realsense:latest
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG PANGOLIN_REF=v0.9.2
+ARG ORB_SLAM3_REF=v1.0-release
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglew-dev libboost-all-dev libssl-dev libeigen3-dev libopencv-dev \
+    libepoxy-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev \
+    wayland-protocols ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "${PANGOLIN_REF}" https://github.com/stevenlovegrove/Pangolin.git /opt/Pangolin \
+    && cmake -S /opt/Pangolin -B /opt/Pangolin/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_PANGOLIN_PYTHON=OFF \
+    && cmake --build /opt/Pangolin/build \
+    && cmake --install /opt/Pangolin/build \
+    && ldconfig \
+    && rm -rf /opt/Pangolin/.git /opt/Pangolin/build
+
+RUN git clone --depth 1 --branch "${ORB_SLAM3_REF}" https://github.com/UZ-SLAMLab/ORB_SLAM3.git /opt/ORB_SLAM3 \
+    && sed -i 's/++11/++14/g' /opt/ORB_SLAM3/CMakeLists.txt \
+    && sed -i 's/-Werror//g' /opt/ORB_SLAM3/Thirdparty/Sophus/CMakeLists.txt \
+    && cd /opt/ORB_SLAM3 \
+    && ./build.sh \
+    && test -x /opt/ORB_SLAM3/Examples/RGB-D/rgbd_tum \
+    && test -s /opt/ORB_SLAM3/Vocabulary/ORBvoc.txt
+
+ENV ORB_SLAM3_RGBD_BIN=/opt/ORB_SLAM3/Examples/RGB-D/rgbd_tum
+ENV ORB_SLAM3_VOCAB=/opt/ORB_SLAM3/Vocabulary/ORBvoc.txt
+
+WORKDIR /work

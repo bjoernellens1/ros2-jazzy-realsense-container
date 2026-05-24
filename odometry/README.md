@@ -62,5 +62,14 @@ The D435i has raw IMU but does not output integrated pose. IMU fusion requires p
 1. Record raw RGB-D-IMU bags.
 2. Verify topic timing, intrinsics, aligned depth, and dropped frames.
 3. Run RTAB-Map RGB-D odometry offline and online.
-4. Compare against ORB-SLAM3 or custom ICP/GICP.
-5. Feed chosen poses into the Gaussian Splatting reconstruction pipeline.
+4. Run the containerized pseudo-GT platform:
+
+   ```bash
+   ./scripts/best_pseudo_gt_from_bag.sh --profile realsense_d435i_ros2 /path/to/bag
+   ```
+
+   For raw TUM RGB-D sequence directories, use `--profile tum_rgbd --input-format tum_rgbd --methods colmap_sfm,orbslam3_rgbd`.
+
+5. Inspect `diagnostics/agreement.json` and only feed `best_pseudo_gt_tum.csv` into Gaussian Splatting when the agreement gate succeeds.
+
+The pseudo-GT platform keeps heavy intermediate frames and matcher databases in container RAM by default. Add `--persist-intermediates` only when debugging extraction or a failed method.

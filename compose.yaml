@@ -51,10 +51,33 @@ x-common: &common
     - ./bags:/work/bags:rw
     - ./logs:/work/logs:rw
     - ./config:/work/config:rw
+    - ./docker:/work/docker:rw
     - ./rviz:/work/rviz:rw
     - ./scripts:/work/scripts:rw
+    - ./tests:/work/tests:rw
     - ./odometry:/work/odometry:rw
   working_dir: /work
+
+x-pseudo-gt: &pseudo-gt
+  <<: *common
+  image: localhost/ros2-jazzy-pseudo-gt:latest
+  build:
+    context: .
+    dockerfile: Containerfile.orbslam3
+    args:
+      BASE_IMAGE: localhost/ros2-jazzy-realsense:latest
+  shm_size: ${PSEUDO_GT_SHM_SIZE:-32gb}
+
+x-pseudo-gt-cuda: &pseudo-gt-cuda
+  <<: *common
+  image: localhost/ros2-jazzy-pseudo-gt-cuda:latest
+  build:
+    context: .
+    dockerfile: Containerfile.cuda
+    args:
+      ROS_DISTRO: jazzy
+  shm_size: ${PSEUDO_GT_SHM_SIZE:-32gb}
+  gpus: all
 
 services:
   shell:
@@ -83,6 +106,16 @@ services:
     command: /work/scripts/_inside_rtabmap_rgbd_odom.sh
 
   pseudo-gt:
-    <<: *common
+    <<: *pseudo-gt
     profiles: ["offline"]
     command: bash
+
+  pseudo-gt-cuda:
+    <<: *pseudo-gt-cuda
+    profiles: ["cuda"]
+    command: bash
+
+  test:
+    <<: *pseudo-gt
+    profiles: ["test"]
+    command: bash -lc "python3 -m py_compile /work/scripts/*.py && pytest -q /work/tests && shellcheck -e SC1090 /work/scripts/*.sh /work/docker/*.sh"

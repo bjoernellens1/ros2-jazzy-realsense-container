@@ -11,7 +11,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg lsb-release locales software-properties-common sudo \
-    git build-essential cmake pkg-config python3-pip \
+    git build-essential cmake pkg-config python3-pip shellcheck \
+    colmap python3-numpy python3-scipy python3-yaml python3-opencv python3-matplotlib python3-pytest \
     usbutils udev v4l-utils less nano vim tmux htop tree \
     mesa-utils libgl1-mesa-dri libglx-mesa0 libegl1 libxkbcommon-x11-0 \
     libxcb-xinerama0 libxcb-cursor0 libxcb-keysyms1 libxcb-image0 libxcb-render-util0 \
@@ -32,8 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
     ros-${ROS_DISTRO}-image-transport-plugins \
     ros-${ROS_DISTRO}-rosbag2-storage-mcap \
-    ros-${ROS_DISTRO}-librealsense2* \
-    ros-${ROS_DISTRO}-realsense2-* \
+    ros-${ROS_DISTRO}-librealsense2 \
+    ros-${ROS_DISTRO}-realsense2-camera \
+    ros-${ROS_DISTRO}-realsense2-camera-msgs \
     ros-${ROS_DISTRO}-rtabmap-ros \
     ros-${ROS_DISTRO}-robot-localization \
     && rm -rf /var/lib/apt/lists/*

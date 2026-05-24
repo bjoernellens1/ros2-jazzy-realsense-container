@@ -1,0 +1,84 @@
+profiles:
+  tum_rgbd:
+    storage: tum_rgbd
+    association_max_dt: 0.05
+    depth_factor: 5000.0
+
+  realsense_d435i_ros1:
+    storage: realsense_ros1_bag
+    camera_name: camera
+    frame_id: camera_link
+    rgb_topics:
+      - /camera/camera/color/image_raw
+    depth_topics:
+      - /camera/camera/aligned_depth_to_color/image_raw
+    raw_depth_topics:
+      - /camera/camera/depth/image_rect_raw
+    camera_info_topics:
+      - /camera/camera/color/camera_info
+    depth_camera_info_topics:
+      - /camera/camera/aligned_depth_to_color/camera_info
+      - /camera/camera/depth/camera_info
+    imu_topics:
+      - /camera/camera/imu
+      - /camera/camera/accel/sample
+    association_max_dt: 0.05
+    depth_factor: 1000.0
+
+  realsense_d435i_ros2:
+    storage: rosbag2
+    camera_name: camera
+    frame_id: camera_link
+    rgb_topics:
+      - /camera/camera/color/image_raw
+    depth_topics:
+      - /camera/camera/aligned_depth_to_color/image_raw
+      - /camera/camera/depth/image_rect_raw
+    raw_depth_topics:
+      - /camera/camera/depth/image_rect_raw
+    camera_info_topics:
+      - /camera/camera/color/camera_info
+    depth_camera_info_topics:
+      - /camera/camera/aligned_depth_to_color/camera_info
+      - /camera/camera/depth/camera_info
+    imu_topics:
+      - /camera/camera/imu
+      - /camera/camera/accel/sample
+    association_max_dt: 0.05
+    depth_factor: 1000.0
+
+  orbbec_femto_bolt_ros2:
+    storage: rosbag2
+    camera_name: camera
+    frame_id: camera_link
+    rgb_topics:
+      - /camera/color/image_raw
+      - /camera/color/image
+      - /camera/rgb/image_raw
+      - /camera/camera/color/image_raw
+    depth_topics:
+      - /camera/depth_registered/image_raw
+      - /camera/aligned_depth_to_color/image_raw
+      - /camera/depth/image_raw
+      - /camera/depth/image
+      - /camera/camera/aligned_depth_to_color/image_raw
+    raw_depth_topics:
+      - /camera/depth/image_raw
+      - /camera/depth/image
+      - /camera/camera/depth/image_rect_raw
+    camera_info_topics:
+      - /camera/color/camera_info
+      - /camera/rgb/camera_info
+      - /camera/camera/color/camera_info
+    depth_camera_info_topics:
+      - /camera/depth_registered/camera_info
+      - /camera/aligned_depth_to_color/camera_info
+      - /camera/depth/camera_info
+      - /camera/camera/aligned_depth_to_color/camera_info
+    imu_topics:
+      - /camera/imu
+      - /camera/accel/sample
+      - /camera/gyro/sample
+      - /camera/camera/imu
+    association_max_dt: 0.05
+    depth_factor: 1000.0

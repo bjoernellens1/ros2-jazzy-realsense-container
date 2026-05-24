@@ -7,10 +7,11 @@ A containerized RealSense starter repo for Fedora hosts. It gives you one Compos
 - RViz2 GUI support
 - easy RGB-D-IMU rosbag recording
 - optional RTAB-Map RGB-D odometry as the first modular SLAM/odometry layer
+- offline pseudo-GT estimation from RealSense and Orbbec RGB-D bags with RTAB-Map, COLMAP, and ORB-SLAM3 agreement checks
 
 The intended host is Fedora KDE/GNOME with Podman or Docker. The container image is Ubuntu 24.04 + ROS 2 Jazzy, because Jazzy and the official ROS packages are native there.
 
-The image follows the `realsense-ros` package pattern of installing `ros-${ROS_DISTRO}-librealsense2*` and `ros-${ROS_DISTRO}-realsense2-*`, so it should include the ROS wrapper, librealsense2 libraries, and RealSense tooling when those packages are available for Jazzy.
+The image installs the Jazzy RealSense wrapper, librealsense2 runtime, and RealSense tooling when those packages are available for Jazzy.
 
 ## Layout
 
@@ -76,6 +77,12 @@ cp .env.example .env
 
 ./scripts/allow_gui.sh
 ./scripts/build.sh
+```
+
+Build the optional CUDA pseudo-GT image for NVIDIA cluster nodes:
+
+```bash
+./scripts/build.sh --cuda
 ```
 
 Start RealSense Viewer:
@@ -161,6 +168,72 @@ Then in another terminal:
 ```
 
 This starts RTAB-Map RGB-D odometry against the RealSense RGB + aligned depth topics and publishes odometry. Treat this as the simplest robust module to add first, not as your final research tracker.
+
+## Offline best pseudo-GT estimation
+
+The pseudo-GT workflow is container-only. The host script only resolves input/output paths and then runs Compose. By default, heavy intermediates are created under container shared memory, so extracted frames, COLMAP databases, temporary sparse models, ORB-SLAM3 scratch files, and RTAB-Map scratch logs do not fill the repository.
+
+RealSense SDK ROS1 bag:
+
+```bash
+./scripts/best_pseudo_gt_from_bag.sh \
+  --profile realsense_d435i_ros1 \
+  --max-frames 500 \
+  --colmap-preset fast \
+  --force \
+  /path/to/recording.bag
+```
+
+RealSense or Orbbec ROS2 MCAP/rosbag2:
+
+```bash
+./scripts/best_pseudo_gt_from_bag.sh \
+  --profile orbbec_femto_bolt_ros2 \
+  --methods rtabmap_rgbd,rtabmap_rgbd_imu,colmap_sfm,orbslam3_rgbd \
+  --workspace-mode ram \
+  --force \
+  /path/to/rosbag2_dir_or_file.mcap
+```
+
+Raw TUM RGB-D sequence directory:
+
+```bash
+./scripts/best_pseudo_gt_from_bag.sh \
+  --profile tum_rgbd \
+  --input-format tum_rgbd \
+  --methods colmap_sfm,orbslam3_rgbd \
+  --max-frames 300 \
+  --force \
+  /path/to/rgbd_dataset_freiburg1_xyz
+```
+
+CUDA path for NVIDIA machines:
+
+```bash
+./scripts/best_pseudo_gt_from_bag.sh --cuda \
+  --profile realsense_d435i_ros2 \
+  --colmap-preset robust \
+  --force \
+  /path/to/rosbag2_dir
+```
+
+The output directory defaults to `<input>_pseudo_gt` and contains only the compact result bundle:
+
+```text
+best_pseudo_gt_tum.csv              # only when agreement succeeds
+candidates/<method>/trajectory_tum.csv
+candidates/<method>/run.log
+diagnostics/agreement.json
+diagnostics/pairwise_agreement.csv
+diagnostics/summary.md
+diagnostics/trajectory_xy.png
+diagnostics/coverage.png
+run_manifest.json
+```
+
+Reliability is agreement-gated. At least two healthy methods must agree with the moderate default gate before `best_pseudo_gt_tum.csv` is written. If no pair agrees, the run exits nonzero, writes diagnostics, and does not call the result reliable. Use `--allow-unreliable-best` only when you explicitly want a low-confidence fallback file named `candidate_best_unreliable_tum.csv`.
+
+Use `--persist-intermediates` to copy the normalized dataset and scratch workspace to disk for debugging. Use `PSEUDO_GT_SHM_SIZE=64gb` with Compose if the default shared-memory workspace is too small.
 
 ## Notes for Gaussian Splatting capture
 
