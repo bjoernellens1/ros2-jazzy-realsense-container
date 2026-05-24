@@ -885,10 +885,9 @@ def run_live_extractor(
             self.depth_topic = profile["depth_topics"][0]
             self.info_topic = profile["camera_info_topics"][0]
             self.max_delta_ns = int(float(profile.get("association_max_dt", 0.05)) * 1_000_000_000)
-            self.depth_queue: list[tuple[int, Any]] = []
-            self.color_queue: list[tuple[int, Any]] = []
-            self.info_msg = None
-            self.pairs: list[tuple[int, Any, int, Any, Any]] = []
+            self.depths: list[tuple[int, Any]] = []
+            self.colors: list[tuple[int, Any]] = []
+            self.infos: list[tuple[int, Any]] = []
             self.last_msg_time = time.time()
             self.sub_rgb = self.node.create_subscription(Image, self.rgb_topic, self.on_rgb, 50)
             self.sub_depth = self.node.create_subscription(Image, self.depth_topic, self.on_depth, 50)
@@ -897,49 +896,24 @@ def run_live_extractor(
 
         def on_rgb(self, msg: Any) -> None:
             self.last_msg_time = time.time()
-            self.color_queue.append((stamp_to_ns(msg.header.stamp), msg))
-            self.try_pair()
+            self.colors.append((stamp_to_ns(msg.header.stamp), msg))
 
         def on_depth(self, msg: Any) -> None:
             self.last_msg_time = time.time()
-            self.depth_queue.append((stamp_to_ns(msg.header.stamp), msg))
-            self.depth_queue = self.depth_queue[-200:]
-            self.try_pair()
+            self.depths.append((stamp_to_ns(msg.header.stamp), msg))
 
         def on_info(self, msg: Any) -> None:
             self.last_msg_time = time.time()
-            if self.info_msg is None:
-                self.info_msg = msg
-
-        def try_pair(self) -> None:
-            if self.info_msg is None or not self.depth_queue:
-                return
-            remaining = []
-            depth_times = [item[0] for item in self.depth_queue]
-            for color_ns, color_msg in self.color_queue:
-                idx = bisect.bisect_left(depth_times, color_ns)
-                choices = []
-                if idx < len(self.depth_queue):
-                    choices.append(self.depth_queue[idx])
-                if idx > 0:
-                    choices.append(self.depth_queue[idx - 1])
-                if not choices:
-                    remaining.append((color_ns, color_msg))
-                    continue
-                depth_ns, depth_msg = min(choices, key=lambda item: abs(item[0] - color_ns))
-                if abs(depth_ns - color_ns) <= self.max_delta_ns:
-                    self.pairs.append((color_ns, color_msg, depth_ns, depth_msg, self.info_msg))
-                    if max_frames > 0 and len(self.pairs) >= max_frames:
-                        rclpy.shutdown()
-                        return
-                else:
-                    remaining.append((color_ns, color_msg))
-            self.color_queue = remaining[-200:]
+            self.infos.append((stamp_to_ns(msg.header.stamp), msg))
 
         def on_timer(self) -> None:
+            if max_frames > 0 and self.infos and len(self.colors) >= max_frames and len(self.depths) >= max_frames:
+                assignments = associate_streams_by_stamp(self.colors, self.depths, self.max_delta_ns)
+                if len(assignments) >= max_frames:
+                    rclpy.shutdown()
             if playback_proc.poll() is not None and time.time() - self.last_msg_time > 3:
                 rclpy.shutdown()
-            if time.time() - self.last_msg_time > 20 and self.pairs:
+            if time.time() - self.last_msg_time > 20 and self.colors and self.depths:
                 rclpy.shutdown()
 
     rclpy.init()
@@ -949,18 +923,71 @@ def run_live_extractor(
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
-        pairs = list(extractor.pairs)
+        colors = sorted(extractor.colors, key=lambda item: item[0])
+        depths = sorted(extractor.depths, key=lambda item: item[0])
+        infos = sorted(extractor.infos, key=lambda item: item[0])
         extractor.node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
-    return write_frames(
+    if not colors or not depths or not infos:
+        raise RuntimeError(
+            f"Missing live RGB-D data: colors={len(colors)} depths={len(depths)} camera_info={len(infos)}"
+        )
+    max_delta_ns = int(float(profile.get("association_max_dt", 0.05)) * 1_000_000_000)
+    assignments = associate_streams_by_stamp(colors, depths, max_delta_ns)
+    sync_report = build_sync_report(
+        profile["rgb_topics"][0],
+        profile["depth_topics"][0],
+        profile["camera_info_topics"][0],
+        raw_color_count=len(colors),
+        raw_depth_count=len(depths),
+        raw_info_count=len(infos),
+        assignments=assignments,
+        colors=colors,
+        depths=depths,
+        max_delta_ns=max_delta_ns,
+        profile=profile,
+    )
+    write_sync_report(dataset, sync_report)
+    if sync_report["status"] != "ok":
+        raise RuntimeError(
+            "Live RealSense RGB-D sync failed: "
+            + ", ".join(sync_report.get("reasons", []))
+            + f" ({sync_report['associated_count']}/{sync_report['raw_color_count']} color frames associated)"
+        )
+    print(
+        "[pseudo-gt] Sync ok: "
+        f"{sync_report['associated_count']}/{sync_report['raw_color_count']} RGB frames associated, "
+        f"median_dt={sync_report.get('median_abs_dt_sec', 0.0):.6f}s, "
+        f"max_dt={sync_report.get('max_abs_dt_sec', 0.0):.6f}s",
+        flush=True,
+    )
+
+    pairs = []
+    for color_idx, depth_idx in assignments:
+        color_ns, color_msg = colors[color_idx]
+        depth_ns, depth_msg = depths[depth_idx]
+        info_msg = nearest_message_by_stamp(infos, color_ns)
+        pairs.append((color_ns, color_msg, depth_ns, depth_msg, info_msg))
+
+    result = write_frames(
         pairs,
         dataset,
         target_fps=target_fps,
         max_frames=max_frames,
         depth_factor=float(profile.get("depth_factor", 1000.0)),
     )
+    result.update(
+        {
+            "raw_color_count": len(colors),
+            "raw_depth_count": len(depths),
+            "raw_camera_info_count": len(infos),
+            "associated_count": len(pairs),
+            "sync": sync_report,
+        }
+    )
+    return result
 
 
 def parse_tum_list(path: Path) -> list[tuple[float, str]]:
