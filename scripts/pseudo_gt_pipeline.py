@@ -906,11 +906,20 @@ def run_live_extractor(
             self.last_msg_time = time.time()
             self.infos.append((stamp_to_ns(msg.header.stamp), msg))
 
+        def has_enough_for_frame_cap(self) -> bool:
+            if max_frames <= 0 or not self.infos or not self.colors or not self.depths:
+                return False
+            assignments = associate_streams_by_stamp(self.colors, self.depths, self.max_delta_ns)
+            if len(assignments) < max_frames:
+                return False
+            if target_fps <= 0:
+                return True
+            span_sec = max(0.0, (self.colors[-1][0] - self.colors[0][0]) / 1e9)
+            return span_sec >= max_frames / target_fps
+
         def on_timer(self) -> None:
-            if max_frames > 0 and self.infos and len(self.colors) >= max_frames and len(self.depths) >= max_frames:
-                assignments = associate_streams_by_stamp(self.colors, self.depths, self.max_delta_ns)
-                if len(assignments) >= max_frames:
-                    rclpy.shutdown()
+            if self.has_enough_for_frame_cap():
+                rclpy.shutdown()
             if playback_proc.poll() is not None and time.time() - self.last_msg_time > 3:
                 rclpy.shutdown()
             if time.time() - self.last_msg_time > 20 and self.colors and self.depths:
