@@ -1370,7 +1370,7 @@ def write_orbslam3_settings(dataset: Path, out_dir: Path) -> Path:
                 f"Camera1.k3: {distortion[4]}",
                 f"Camera.width: {width}",
                 f"Camera.height: {height}",
-                "Camera.fps: 30.0",
+                "Camera.fps: 30",
                 "Camera.RGB: 1",
                 "Stereo.ThDepth: 40.0",
                 f"Stereo.b: {stereo_b}",
