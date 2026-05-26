@@ -7,6 +7,7 @@ import csv
 import json
 import math
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -20,7 +21,7 @@ from typing import Any
 import numpy as np
 
 
-DEFAULT_METHODS = "rtabmap_rgbd,rtabmap_rgbd_imu,colmap_sfm,orbslam3_rgbd,orbslam3_rgbd_imu"
+DEFAULT_METHODS = "rtabmap_rgbd,colmap_sfm,orbslam3_rgbd,orbslam3_rgbd_imu"
 VALID_METHODS = {"rtabmap_rgbd", "rtabmap_rgbd_imu", "colmap_sfm", "orbslam3_rgbd", "orbslam3_rgbd_imu"}
 TUM_FREIBURG_INTRINSICS = {
     "freiburg1": {
@@ -403,6 +404,10 @@ def msg_stamp_ns(msg: Any, fallback_ns: int) -> int:
 
 
 def ensure_empty_output(path: Path, force: bool) -> None:
+    """Check/clean the output location but do NOT create it yet.
+    The caller is responsible for creating it after normalize succeeds,
+    so a normalize crash doesn't leave an empty output directory behind.
+    """
     if path.exists():
         if not force:
             raise SystemExit(f"Output already exists: {path}. Re-run with --force to replace it.")
@@ -410,7 +415,6 @@ def ensure_empty_output(path: Path, force: bool) -> None:
             shutil.rmtree(path)
         else:
             path.unlink()
-    path.mkdir(parents=True, exist_ok=True)
 
 
 def make_workspace(output: Path, mode: str, keep: bool) -> Path:
@@ -645,12 +649,29 @@ def write_frames(
         frames_writer.writeheader()
         quality_writer.writeheader()
 
+        # Resolve target (w, h) from the first info_msg so every frame is
+        # resized consistently when the SDK republishes at a different resolution
+        # than what was originally calibrated (e.g. D435i bag at 640×480 but
+        # SDK defaults to 1280×720 on replay).
+        _ci_ref = write_camera_info_json(pairs[0][4], camera_info_json)
+        _target_w = int(_ci_ref.get("width", 0))
+        _target_h = int(_ci_ref.get("height", 0))
+        if _target_w > 640 or _target_h > 480:
+            _target_w = 640
+            _target_h = 480
+
         for color_ns, color_msg, depth_ns, depth_msg, info_msg in pairs:
             ts = ns_to_sec(color_ns)
             if ts - last_kept_ts < min_dt:
                 continue
             color = image_to_array(color_msg, is_depth=False)
             depth = normalize_depth(image_to_array(depth_msg, is_depth=True), depth_factor)
+            # Resize to calibrated dimensions if SDK republished at a different resolution.
+            if _target_w > 0 and _target_h > 0:
+                ih, iw = color.shape[:2]
+                if iw != _target_w or ih != _target_h:
+                    color = cv2.resize(color, (_target_w, _target_h), interpolation=cv2.INTER_LINEAR)
+                    depth = cv2.resize(depth, (_target_w, _target_h), interpolation=cv2.INTER_NEAREST)
             q_blur = blur_score(color)
             q_clip = exposure_clip_ratio(color)
             q_depth = depth_valid_ratio(depth)
@@ -704,6 +725,9 @@ def write_frames(
 
     if kept == 0:
         raise RuntimeError("No synchronized RGB-D frames were extracted.")
+    if camera_info is not None:
+        write_calibration_yaml(dataset, camera_info)
+    create_rtabmap_sync_dirs(dataset)
     return {"frame_count": kept, "camera_info": camera_info}
 
 
@@ -1111,6 +1135,97 @@ def resolve_dataset_file(root: Path, value: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
+def write_calibration_yaml(dataset: Path, camera_info: dict[str, Any]) -> None:
+    """Write a ROS camera_info YAML for rtabmap-rgbd_dataset to read."""
+    fx = float(camera_info["fx"])
+    fy = float(camera_info["fy"])
+    cx = float(camera_info["cx"])
+    cy = float(camera_info["cy"])
+    w = int(camera_info.get("width", 640))
+    h = int(camera_info.get("height", 480))
+    d = [float(v) for v in camera_info.get("d", [])]
+    while len(d) < 5:
+        d.append(0.0)
+    d_str = "[" + ", ".join(f"{v}" for v in d) + "]"
+    content = (
+        f"image_width: {w}\n"
+        f"image_height: {h}\n"
+        f"camera_name: camera\n"
+        f"camera_matrix:\n"
+        f"  rows: 3\n"
+        f"  cols: 3\n"
+        f"  data: [{fx}, 0, {cx}, 0, {fy}, {cy}, 0, 0, 1]\n"
+        f"distortion_model: plumb_bob\n"
+        f"distortion_coefficients:\n"
+        f"  rows: 1\n"
+        f"  cols: 5\n"
+        f"  data: {d_str}\n"
+        # RTAB-Map's CameraModel parser historically checks this misspelled key.
+        f"distorsion_coefficients:\n"
+        f"  rows: 1\n"
+        f"  cols: 5\n"
+        f"  data: {d_str}\n"
+        f"rectification_matrix:\n"
+        f"  rows: 3\n"
+        f"  cols: 3\n"
+        f"  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]\n"
+        f"projection_matrix:\n"
+        f"  rows: 3\n"
+        f"  cols: 4\n"
+        f"  data: [{fx}, 0, {cx}, 0, 0, {fy}, {cy}, 0, 0, 0, 1, 0]\n"
+    )
+    (dataset / "calibration.yaml").write_text(content, encoding="utf-8")
+    # rtabmap-rgbd_dataset with --output_name rtabmap looks for rtabmap_calib.yaml
+    (dataset / "rtabmap_calib.yaml").write_text(content, encoding="utf-8")
+
+
+def create_rtabmap_sync_dirs(dataset: Path) -> None:
+    """Create rgb_sync/ and depth_sync/ with timestamp-named symlinks for rtabmap-rgbd_dataset.
+
+    rtabmap-rgbd_dataset expects filenames to be parseable as floating-point timestamps.
+    We symlink from timestamp names back to the frame_NNNNNN.png files in images/ and depth/.
+    """
+    assoc_txt = dataset / "associations.txt"
+    if not assoc_txt.exists():
+        return
+    pairs = parse_tum_associations(assoc_txt)
+    rgb_sync = dataset / "rgb_sync"
+    depth_sync = dataset / "depth_sync"
+    rgb_sync.mkdir(exist_ok=True)
+    depth_sync.mkdir(exist_ok=True)
+    for rgb_ts, rgb_rel, _depth_ts, depth_rel in pairs:
+        rgb_src = dataset / rgb_rel
+        dep_src = dataset / depth_rel
+        rgb_link = rgb_sync / f"{rgb_ts:.6f}.png"
+        dep_link = depth_sync / f"{rgb_ts:.6f}.png"
+        if not rgb_link.exists() and rgb_src.exists():
+            os.symlink(os.path.relpath(rgb_src, rgb_sync), rgb_link)
+        if not dep_link.exists() and dep_src.exists():
+            os.symlink(os.path.relpath(dep_src, depth_sync), dep_link)
+
+
+def count_tum_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                count += 1
+    return count
+
+
+def normalized_frame_count(dataset: Path) -> int:
+    assoc = dataset / "associations.txt"
+    if assoc.exists():
+        return count_tum_rows(assoc)
+    frames = dataset / "frames.csv"
+    if frames.exists():
+        return max(0, count_tum_rows(frames) - 1)
+    return 0
+
+
 def associate_tum_rgbd(root: Path, max_dt: float) -> list[tuple[float, str, float, str]]:
     assoc = root / "associations.txt"
     if assoc.exists():
@@ -1266,7 +1381,7 @@ def normalize_hypersim(
 
         for color_entry in color_entries:
             frame_idx = int(Path(color_entry).name.split(".")[1])
-            ts = float(frame_idx) * frame_time
+            ts = (frame_idx + 1) * frame_time  # +1 so ts>0; rtabmap rejects ts=0
             if ts - last_kept_ts < min_dt:
                 continue
             depth_entry = depth_entries.get(frame_idx)
@@ -1362,7 +1477,7 @@ def normalize_hypersim(
             fgt.write("# timestamp tx ty tz qx qy qz qw\n")
             n_gt = min(len(gt_positions), len(gt_orientations))
             for fi in range(n_gt):
-                ts_gt = float(fi) * frame_time
+                ts_gt = (fi + 1) * frame_time  # +1 matches image timestamps (also +1)
                 t = gt_positions[fi] * meters_per_unit
                 R = gt_orientations[fi].reshape(3, 3)
                 # Rotation matrix → quaternion (Hamilton convention).
@@ -1397,15 +1512,15 @@ def normalize_hypersim(
         has_gt = True
 
     print(f"[pseudo-gt] Hypersim: kept {kept} frames, skipped {skipped}")
+    cam_info = {"width": W, "height": H, "fx": fx, "fy": fy, "cx": cx, "cy": cy, "depth_factor": depth_scale}
+    write_calibration_yaml(dataset, cam_info)
+    create_rtabmap_sync_dirs(dataset)
     return {
         "input_format": "hypersim",
         "frame_count": kept,
         "skipped": skipped,
         "has_groundtruth": has_gt,
-        "camera_info": {
-            "width": W, "height": H, "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-            "depth_factor": depth_scale,
-        },
+        "camera_info": cam_info,
     }
 
 
@@ -1492,6 +1607,9 @@ def normalize_tum_rgbd(
             if depth.ndim == 3:
                 depth = depth[:, :, 0]
             depth = normalize_depth(depth, depth_factor=1.0)
+            # Rescale to mm (1000 units/m) — canonical depth unit for all methods.
+            if depth_factor != 1000.0:
+                depth = (depth.astype(np.float32) * (1000.0 / depth_factor)).clip(0, 65535).astype(np.uint16)
             q_blur = blur_score(color)
             q_clip = exposure_clip_ratio(color)
             q_depth = depth_valid_ratio(depth)
@@ -1540,6 +1658,11 @@ def normalize_tum_rgbd(
 
     if kept == 0:
         raise RuntimeError("No synchronized TUM RGB-D frames were normalized.")
+    # Canonical invariant: depth_factor is always 1000 (mm) after normalization.
+    camera_info["depth_factor"] = 1000.0
+    write_camera_info_dict(camera_info, camera_info_json)
+    write_calibration_yaml(dataset, camera_info)
+    create_rtabmap_sync_dirs(dataset)
     return {
         "input_format": "tum_rgbd",
         "frame_count": kept,
@@ -1547,7 +1670,7 @@ def normalize_tum_rgbd(
         "skipped_missing": skipped_missing,
         "skipped_unreadable": skipped_unreadable,
         "camera_info": camera_info,
-        "depth_factor": depth_factor,
+        "depth_factor": 1000.0,
     }
 
 
@@ -1578,6 +1701,21 @@ def normalize_bag(
     )
 
 
+def _zip_is_rosbag2(path: Path) -> bool:
+    """Return True if the zip contains a rosbag2 archive (metadata.yaml + mcap/db3)."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+        return any(
+            n == "metadata.yaml" or n.endswith("/metadata.yaml")
+            or n.endswith(".mcap") or n.endswith(".db3")
+            for n in names
+        )
+    except Exception:
+        return False
+
+
 def detect_input_format(path: Path, requested: str, profile: dict[str, Any]) -> str:
     if requested != "auto":
         return requested
@@ -1585,7 +1723,13 @@ def detect_input_format(path: Path, requested: str, profile: dict[str, Any]) -> 
         return "tum_rgbd"
     if path.is_dir() and (path / "rgb.txt").exists() and (path / "depth.txt").exists():
         return "tum_rgbd"
-    if path.suffix == ".zip" or profile.get("storage") == "hypersim":
+    if path.suffix == ".zip":
+        # Peek inside: a zip that contains metadata.yaml or mcap/db3 files is a
+        # rosbag2 archive, not a Hypersim scene.
+        if _zip_is_rosbag2(path):
+            return "bag"
+        return "hypersim"
+    if profile.get("storage") == "hypersim":
         return "hypersim"
     return "bag"
 
@@ -1656,89 +1800,308 @@ def normalize_input(
     return result
 
 
-def start_bag_playback(bag: Path, profile: dict[str, Any], log: Path) -> subprocess.Popen:
-    if profile.get("storage") == "realsense_ros1_bag":
-        return launch_realsense_ros1_bag(bag, profile, log)
-    cmd = ["ros2", "bag", "play", str(bag), "--clock"]
-    log.parent.mkdir(parents=True, exist_ok=True)
-    fh = log.open("a", encoding="utf-8")
-    fh.write("+ " + " ".join(cmd) + "\n")
-    fh.flush()
-    return subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+
+def rtabmap_preset_args(preset: str, profile: dict[str, Any]) -> list[str]:
+    if preset == "default":
+        return [
+            "--Vis/MinInliers", str(profile.get("rtabmap_vis_min_inliers", 8)),
+            "--Kp/MaxFeatures", str(profile.get("rtabmap_kp_max_features", 500)),
+            "--Rtabmap/DetectionRate", "0",
+        ]
+    # fast: halved features (500→250) vs default.
+    # Empirically measured effect (freiburg1_desk 20fps, same 290 frames):
+    #   odom: 31→26ms (-16%)  slam: 21→25ms (+18%)  total: 58→57ms (-2%)
+    #   median frame: 52→48ms  on-budget (≤50ms): 44%→51%  wall fps: 16.8→17.1
+    # The slam step self-compensates: fewer features → sparser local map →
+    # higher KF insertion rate (45%→67%) → same total backend compute.
+    # Mem/STMSize omitted — empirically worsened slam spikes (20→41 >50ms frames)
+    # by triggering frequent STM→LTM evictions.
+    # Net gain is modest (~2% wall fps, 7pp more on-budget frames).
+    # For real-time at 20fps, reduce input to ≤10fps via --target-fps instead.
+    if preset == "fast":
+        return [
+            "--Vis/MinInliers", str(profile.get("rtabmap_vis_min_inliers", 6)),
+            "--Kp/MaxFeatures", "250",
+            "--Rtabmap/DetectionRate", "0",
+        ]
+    args = [
+        "--Vis/MinInliers", "20",
+        "--Kp/MaxFeatures", "1500",
+        "--Vis/MaxFeatures", "2000",
+        "--Odom/Strategy", "0",
+        "--Rtabmap/DetectionRate", "0",
+    ]
+    if preset == "robust":
+        return args
+    if preset == "f2f":
+        f2f_args = list(args)
+        f2f_args[f2f_args.index("--Odom/Strategy") + 1] = "1"
+        return f2f_args
+    if preset == "dense-keyframes":
+        return [*args, "--Odom/KeyFrameThr", "0", "--Odom/VisKeyFrameThr", "0"]
+    raise ValueError(f"Unknown RTAB-Map preset: {preset}")
+
+
+def _rtabmap_export_candidates(db: Path) -> list[Path]:
+    return [
+        db.with_name(f"{db.stem}_odom.txt"),
+        db.with_name(f"{db.name}_odom.txt"),
+        db.parent / "rtabmap_odom.txt",
+    ]
+
+
+def export_rtabmap_node_poses(db: Path, output: Path) -> tuple[int, str]:
+    import sqlite3
+    import struct
+
+    from scipy.spatial.transform import Rotation
+
+    rows: list[tuple[float, np.ndarray, np.ndarray]] = []
+    try:
+        con = sqlite3.connect(str(db))
+        cur = con.cursor()
+        for stamp, blob in cur.execute("select stamp, pose from Node where pose is not null order by stamp"):
+            if blob is None or len(blob) != 48:
+                continue
+            mat = np.asarray(struct.unpack("12f", blob), dtype=float).reshape(3, 4)
+            q = Rotation.from_matrix(mat[:, :3]).as_quat()
+            rows.append((float(stamp), mat[:, 3], q))
+    except Exception as exc:
+        return 0, str(exc)
+    finally:
+        try:
+            con.close()  # type: ignore[name-defined]
+        except Exception:
+            pass
+
+    if not rows:
+        return 0, "no Node.pose rows found"
+    with output.open("w", encoding="utf-8") as fh:
+        fh.write("#timestamp x y z qx qy qz qw\n")
+        for ts, t, q in rows:
+            fh.write(
+                f"{ts:.9f} {t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "
+                f"{q[0]:.9f} {q[1]:.9f} {q[2]:.9f} {q[3]:.9f}\n"
+            )
+    return len(rows), ""
+
+
+def parse_rtabmap_log_metrics(log: Path) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "calibration_warning_count": 0,
+        "local_transform": "",
+    }
+    if not log.exists():
+        return metrics
+    text = log.read_text(encoding="utf-8", errors="replace")
+    metrics["calibration_warning_count"] = sum(
+        1
+        for line in text.splitlines()
+        if "CameraModel.cpp" in line and "Missing" in line
+    )
+    import re
+
+    match = re.search(r"Using local transform from calibration file \(([^)]*)\)", text)
+    if match:
+        metrics["local_transform"] = match.group(1)
+    m_kp = re.search(r"Kp/MaxFeatures=(\d+)", text)
+    if m_kp:
+        metrics["kp_max_features"] = int(m_kp.group(1))
+    trans = re.findall(r"translational_rmse=\s*([0-9.eE+-]+)", text)
+    rot = re.findall(r"rotational_rmse=\s*([0-9.eE+-]+)", text)
+    if trans:
+        metrics["rtabmap_reported_translational_rmse"] = float(trans[-1])
+    if rot:
+        metrics["rtabmap_reported_rotational_rmse_deg"] = float(rot[-1])
+    # Total wall-clock time reported by rtabmap-rgbd_dataset
+    m_total = re.search(r"Total time=([0-9.]+)s", text)
+    if m_total:
+        total_sec = float(m_total.group(1))
+        metrics["total_tracking_time_sec"] = total_sec
+    # Per-step averages from the rtabmap-report summary line:
+    #   slam: avg=34 ms (max=...), odom: avg=26ms (max=...), camera: avg=5ms
+    m_slam = re.search(r"slam:\s*avg=([0-9]+)\s*ms", text)
+    m_odom = re.search(r"odom:\s*avg=([0-9]+)\s*ms", text)
+    m_cam = re.search(r"camera:\s*avg=([0-9]+)\s*ms", text)
+    if m_slam:
+        metrics["slam_avg_ms"] = int(m_slam.group(1))
+    if m_odom:
+        metrics["odom_avg_ms"] = int(m_odom.group(1))
+    if m_cam:
+        metrics["camera_avg_ms"] = int(m_cam.group(1))
+    # runtime_fps: frames processed per wall-clock second (total_time basis)
+    frame_match = re.search(r"Iteration (\d+)/(\d+):", text)
+    if frame_match and m_total and total_sec > 0:
+        n_frames = int(frame_match.group(2))
+        metrics["runtime_fps"] = round(n_frames / total_sec, 2)
+    elif m_slam and m_odom and m_cam:
+        per_frame_ms = int(m_slam.group(1)) + int(m_odom.group(1)) + int(m_cam.group(1))
+        if per_frame_ms > 0:
+            metrics["runtime_fps"] = round(1000.0 / per_frame_ms, 2)
+    return metrics
+
+
+def parse_orbslam3_log_metrics(log: Path) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    if not log.exists():
+        return metrics
+    import re
+    text = log.read_text(encoding="utf-8", errors="replace")
+    m_mean = re.search(r"mean tracking time:\s*([0-9.eE+-]+)", text)
+    m_med = re.search(r"median tracking time:\s*([0-9.eE+-]+)", text)
+    if m_mean:
+        mean_sec = float(m_mean.group(1))
+        metrics["mean_tracking_time_sec"] = mean_sec
+        if mean_sec > 0:
+            metrics["runtime_fps"] = round(1.0 / mean_sec, 2)
+    if m_med:
+        metrics["median_tracking_time_sec"] = float(m_med.group(1))
+    return metrics
+
+
+def parse_colmap_log_metrics(log: Path) -> dict[str, Any]:
+    """Extract per-stage elapsed times from COLMAP log (minutes → seconds).
+
+    feature_extractor emits 1 elapsed-time line.
+    sequential_matcher emits 2 (sift matching + geometric verification).
+    mapper emits 1.
+    Strategy: first line → extractor, last line → mapper, middle lines → matcher.
+    """
+    metrics: dict[str, Any] = {}
+    if not log.exists():
+        return metrics
+    import re
+    text = log.read_text(encoding="utf-8", errors="replace")
+    elapsed = [float(v) for v in re.findall(r"Elapsed time:\s*([0-9.]+)\s*\[minutes\]", text)]
+    if len(elapsed) >= 1:
+        metrics["feature_extraction_sec"] = round(elapsed[0] * 60.0, 1)
+    if len(elapsed) >= 2:
+        # last = mapper; middle = matcher (sum of any sub-steps)
+        metrics["mapper_sec"] = round(elapsed[-1] * 60.0, 1)
+        middle = elapsed[1:-1]
+        if middle:
+            metrics["sequential_matching_sec"] = round(sum(middle) * 60.0, 1)
+    return metrics
+
+
+def export_rtabmap_dense_odom(dataset: Path, out_dir: Path, log: Path) -> tuple[Path | None, dict[str, Any], str]:
+    db = out_dir / "rtabmap.db"
+    metrics: dict[str, Any] = {
+        "database": str(db),
+        "expected_frame_count": normalized_frame_count(dataset),
+    }
+    if not db.exists() or db.stat().st_size == 0:
+        return None, metrics, "rtabmap.db was not written"
+    report_bin = shutil.which("rtabmap-report")
+    if report_bin is None:
+        return None, metrics, "rtabmap-report binary not found"
+
+    cmd = [report_bin, "--poses_raw"]
+    gt = dataset / "groundtruth.txt"
+    if gt.exists():
+        cmd += ["--gt", str(gt)]
+    cmd.append(str(db))
+    rc = run(cmd, log=log, progress_label="rtabmap_rgbd:export_odom")
+    metrics["rtabmap_report_exit_code"] = rc
+    if rc != 0:
+        return None, metrics, "rtabmap-report --poses_raw failed"
+
+    candidates = [p for p in _rtabmap_export_candidates(db) if p.exists() and p.stat().st_size > 0]
+    if not candidates:
+        candidates = sorted(out_dir.glob("*_odom.txt"))
+    expected = int(metrics["expected_frame_count"])
+    min_dense = math.ceil(expected * 0.90) if expected > 0 else 30
+
+    dense = candidates[0] if candidates else None
+    dense_count = count_tum_rows(dense) if dense is not None else 0
+    source = "rtabmap-report"
+    if dense_count < min_dense:
+        node_dense = out_dir / "rtabmap_node_odom.txt"
+        node_count, node_reason = export_rtabmap_node_poses(db, node_dense)
+        metrics["database_node_pose_count"] = node_count
+        if node_reason:
+            metrics["database_node_pose_reason"] = node_reason
+        if node_count >= min_dense:
+            dense = node_dense
+            dense_count = node_count
+            source = "database_node_pose"
+    if dense is None:
+        return None, metrics, "dense odometry export was not written"
+
+    metrics.update(
+        {
+            "dense_odom_export": str(dense),
+            "dense_odom_source": source,
+            "dense_odom_pose_count": dense_count,
+            "dense_odom_min_pose_count": min_dense,
+            "dense_odom_coverage_ratio": (dense_count / expected) if expected > 0 else None,
+        }
+    )
+    if dense_count < min_dense:
+        return None, metrics, "dense_odom_too_sparse"
+    return dense, metrics, ""
 
 
 def run_rtabmap_candidate(
     method: str,
-    bag: Path,
+    dataset: Path,
     out_dir: Path,
     profile: dict[str, Any],
+    rtabmap_preset: str,
     progress: ProgressReporter | None = None,
 ) -> CandidateResult:
-    subscribe_imu = method == "rtabmap_rgbd_imu"
+    if method == "rtabmap_rgbd_imu":
+        log = out_dir / "run.log"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log.write_text("rtabmap_rgbd_imu is not supported in dataset mode (rtabmap-rgbd_dataset has no IMU path).\n", encoding="utf-8")
+        return CandidateResult(method, "failed", None, log, {}, "rtabmap_rgbd_imu not supported in dataset mode")
     log = out_dir / "run.log"
     out_dir.mkdir(parents=True, exist_ok=True)
     tum = out_dir / "trajectory_tum.csv"
-    full = out_dir / "trajectory_full.csv"
-    if subscribe_imu and not profile.get("imu_topics"):
-        return CandidateResult(method, "failed", None, log, {}, "profile has no IMU topic")
-    processes: list[subprocess.Popen] = []
+    binary = Path(os.environ.get("RTABMAP_RGBD_DATASET_BIN", "/opt/ros/jazzy/bin/rtabmap-rgbd_dataset"))
+    if not binary.exists():
+        return CandidateResult(method, "failed", None, log, {}, f"rtabmap-rgbd_dataset binary not found: {binary}")
+    if not (dataset / "rgb_sync").exists() or not (dataset / "depth_sync").exists():
+        return CandidateResult(method, "failed", None, log, {}, "dataset missing rgb_sync/ or depth_sync/ (normalization incomplete)")
     try:
-        playback = start_bag_playback(bag, profile, log)
-        processes.append(playback)
-        rgb_topic = profile["rgb_topics"][0]
-        depth_topic = profile["depth_topics"][0]
-        info_topic = profile["camera_info_topics"][0]
-        required_topics = [rgb_topic, depth_topic, info_topic]
-        if subscribe_imu and profile.get("imu_topics"):
-            required_topics.append(profile["imu_topics"][0])
-        wait_for_topics(required_topics, timeout=60, log=log)
-
-        env = os.environ.copy()
-        env.update(
-            {
-                "PSEUDO_GT_RGB_TOPIC": rgb_topic,
-                "PSEUDO_GT_DEPTH_TOPIC": depth_topic,
-                "PSEUDO_GT_CAMERA_INFO_TOPIC": info_topic,
-                "PSEUDO_GT_IMU_TOPIC": profile.get("imu_topics") and profile["imu_topics"][0] or "/camera/imu",
-                "RTABMAP_SUBSCRIBE_IMU": "true" if subscribe_imu else "false",
-                "RTABMAP_FRAME_ID": str(profile.get("frame_id", "camera_link")),
-            }
-        )
-        with log.open("a", encoding="utf-8") as fh:
-            fh.write("[rtabmap] starting odometry\n")
-            fh.flush()
-            rtab_proc = subprocess.Popen(
-                ["/work/scripts/_inside_rtabmap_rgbd_odom.sh"],
-                stdout=fh,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env,
-                start_new_session=True,
-            )
-        processes.append(rtab_proc)
-
-        record_cmd = [
-            "python3",
-            "/work/scripts/record_odom_tum.py",
-            "--topic",
-            "/rtabmap/odom",
-            "--tum",
-            str(tum),
-            "--full-csv",
-            str(full),
-            "--startup-timeout",
-            "90",
-            "--idle-timeout",
-            "15",
+        camera_info = json.loads((dataset / "camera_info.json").read_text(encoding="utf-8"))
+        depth_factor = float(camera_info.get("depth_factor", 1000.0))
+        cmd = [
+            str(binary),
+            "--output", str(out_dir),
+            "--output_name", "rtabmap",
+            *rtabmap_preset_args(rtabmap_preset, profile),
         ]
-        rc = run(record_cmd, log=log, progress=progress, progress_label=f"{method}:record_odom")
-        if rc != 0 or not tum.exists() or tum.stat().st_size == 0:
-            return CandidateResult(method, "failed", None, log, {}, "rtabmap did not produce odometry")
-        return CandidateResult(method, "ok", tum, log, {"subscribe_imu": subscribe_imu})
+        # depth_factor should be 1000 (mm) after normalization; pass it explicitly to be safe
+        if depth_factor != 1000.0:
+            cmd += ["--RGBD/DepthScalingFactor", str(1000.0 / depth_factor)]
+        cmd.append(str(dataset))
+        if not os.environ.get("DISPLAY"):
+            cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1280x720x24", *cmd]
+        rc = run(cmd, log=log, progress=progress, progress_label=f"{method}:track")
+        dense, export_metrics, export_reason = export_rtabmap_dense_odom(dataset, out_dir, log)
+        metrics = {
+            "exit_code": rc,
+            "preset": rtabmap_preset,
+            **parse_rtabmap_log_metrics(log),
+            **export_metrics,
+        }
+        if export_reason:
+            metrics["dense_odom_export_reason"] = export_reason
+        (out_dir / "rtabmap_metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        if dense is None:
+            reason = "dense_odom_export_failed" if export_reason != "dense_odom_too_sparse" else export_reason
+            return CandidateResult(method, "failed", None, log, metrics, reason)
+        poses_file = out_dir / "rtabmap_poses.txt"
+        if not poses_file.exists() or poses_file.stat().st_size == 0:
+            metrics["sparse_graph_pose_count"] = 0
+        else:
+            metrics["sparse_graph_pose_count"] = count_tum_rows(poses_file)
+        (out_dir / "rtabmap_metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        shutil.copy2(dense, tum)
+        return CandidateResult(method, "ok", tum, log, metrics)
     except Exception as exc:
         return CandidateResult(method, "failed", None, log, {}, str(exc))
-    finally:
-        terminate_processes(processes)
 
 
 def camera_params_from_info(camera_info: dict[str, Any]) -> tuple[float, float, float, float]:
@@ -1969,6 +2332,7 @@ def run_colmap_candidate(
         metrics = export_colmap_tum(dataset, sparse_txt, tum)
         metrics["preset"] = preset
         metrics["use_gpu"] = gpu_flag
+        metrics.update(parse_colmap_log_metrics(log))
         if not tum.exists() or tum.stat().st_size == 0:
             return CandidateResult(method, "failed", None, log, metrics, "COLMAP registered no exportable frames")
         return CandidateResult(method, "ok", tum, log, metrics)
@@ -2070,13 +2434,16 @@ def write_orbslam3_settings(
                 f"IMU.Frequency: {float(orb_imu.get('frequency', 200.0))}",
             ]
         )
+    # Hypersim renders are locally low-gradient; more features and lower FAST thresholds
+    # improve tracking on pre-rendered synthetic imagery.
+    is_hypersim = profile.get("name") == "hypersim"
     lines.extend(
         [
-            "ORBextractor.nFeatures: 1250" if with_imu else "ORBextractor.nFeatures: 1000",
+            "ORBextractor.nFeatures: 2000" if is_hypersim else ("ORBextractor.nFeatures: 1250" if with_imu else "ORBextractor.nFeatures: 1000"),
             "ORBextractor.scaleFactor: 1.2",
-            "ORBextractor.nLevels: 8",
-            "ORBextractor.iniThFAST: 20",
-            "ORBextractor.minThFAST: 7",
+            "ORBextractor.nLevels: 10" if is_hypersim else "ORBextractor.nLevels: 8",
+            "ORBextractor.iniThFAST: 12" if is_hypersim else "ORBextractor.iniThFAST: 20",
+            "ORBextractor.minThFAST: 5" if is_hypersim else "ORBextractor.minThFAST: 7",
             "Viewer.KeyFrameSize: 0.05",
             "Viewer.KeyFrameLineWidth: 1.0",
             "Viewer.GraphLineWidth: 0.9",
@@ -2138,13 +2505,14 @@ def run_orbslam3_candidate(
     if not os.environ.get("DISPLAY"):
         cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1280x720x24", *cmd]
     rc = run(cmd, log=log, cwd=out_dir, progress=progress, progress_label=f"{method}:track")
+    timing = parse_orbslam3_log_metrics(log)
     for candidate in (out_dir / "CameraTrajectory.txt", out_dir / "KeyFrameTrajectory.txt"):
         if candidate.exists() and candidate.stat().st_size > 0:
             shutil.copy2(candidate, tum)
-            return CandidateResult(method, "ok", tum, log, {"source": candidate.name, "exit_code": rc})
+            return CandidateResult(method, "ok", tum, log, {"source": candidate.name, "exit_code": rc, **timing})
     if rc != 0:
-        return CandidateResult(method, "failed", None, log, {"exit_code": rc}, "ORB-SLAM3 command failed")
-    return CandidateResult(method, "failed", None, log, {}, "ORB-SLAM3 did not write a trajectory")
+        return CandidateResult(method, "failed", None, log, {"exit_code": rc, **timing}, "ORB-SLAM3 command failed")
+    return CandidateResult(method, "failed", None, log, {**timing}, "ORB-SLAM3 did not write a trajectory")
 
 
 def read_tum(path: Path) -> dict[str, np.ndarray]:
@@ -2267,6 +2635,7 @@ def evaluate_pair(
         and rmse <= 0.20
         and median <= 0.10
         and max_gap <= 5.0
+        and 1e-3 < scale < 1e3  # reject collapsed/exploded Sim3 fits
     )
     result.update(
         {
@@ -2305,15 +2674,32 @@ def evaluate_agreement(
             continue
         traj = read_tum(result.trajectory)
         poses = int(len(traj["t"]))
-        ok = poses >= 30
+        if poses < 30:
+            health[result.method] = {
+                "status": "unhealthy",
+                "reason": "too_few_poses",
+                "poses": poses,
+                "duration_sec": trajectory_duration(traj),
+            }
+            continue
+        # Reject degenerate (all-identity) trajectories: max extent < 5 cm
+        pos_extent = float(np.linalg.norm(np.max(traj["p"], axis=0) - np.min(traj["p"], axis=0)))
+        if pos_extent < 0.05:
+            health[result.method] = {
+                "status": "unhealthy",
+                "reason": "degenerate_trajectory",
+                "poses": poses,
+                "duration_sec": trajectory_duration(traj),
+                "pos_extent_m": pos_extent,
+            }
+            continue
         health[result.method] = {
-            "status": "ok" if ok else "unhealthy",
-            "reason": "ok" if ok else "too_few_poses",
+            "status": "ok",
+            "reason": "ok",
             "poses": poses,
             "duration_sec": trajectory_duration(traj),
         }
-        if ok:
-            healthy[result.method] = traj
+        healthy[result.method] = traj
 
     run_duration = max((trajectory_duration(t) for t in healthy.values()), default=0.0)
     pairwise = []
@@ -2321,6 +2707,13 @@ def evaluate_agreement(
     for i, name_a in enumerate(names):
         for name_b in names[i + 1 :]:
             pairwise.append(evaluate_pair(name_a, healthy[name_a], name_b, healthy[name_b], run_duration))
+
+    # A winner must cover at least 25 % of the longest healthy trajectory's
+    # duration. This prevents two short-lived variants of the same algorithm
+    # (e.g. rtabmap_rgbd + rtabmap_rgbd_imu both losing tracking at 24 s) from
+    # agreeing with each other and falsely winning over longer-coverage methods.
+    max_duration = max((health[n].get("duration_sec", 0.0) for n in names), default=0.0)
+    min_winner_duration = max_duration * 0.25
 
     support = {name: 0 for name in names}
     errors = {name: [] for name in names}
@@ -2331,7 +2724,37 @@ def evaluate_agreement(
             errors[pair["method_a"]].append(pair.get("median", math.inf))
             errors[pair["method_b"]].append(pair.get("median", math.inf))
 
-    supported = [name for name, count in support.items() if count > 0]
+    # Compare each healthy candidate against ground truth if available.
+    gt_comparisons: list[dict[str, Any]] = []
+    if dataset is not None and healthy:
+        gt_path = dataset / "groundtruth.txt"
+        if gt_path.exists():
+            gt_traj = read_tum(gt_path)
+            _gt_nonzero = int(np.any(gt_traj["p"] != 0, axis=1).sum()) if len(gt_traj["t"]) else 0
+            _gt_ok = len(gt_traj["t"]) >= 3 and _gt_nonzero >= max(3, len(gt_traj["t"]) * 0.05)
+            if not _gt_ok:
+                print(
+                    f"[pseudo-gt] Skipping GT comparison: only {_gt_nonzero}/{len(gt_traj['t'])} "
+                    "non-zero poses (degenerate GT file)"
+                )
+            if _gt_ok:
+                print(f"[pseudo-gt] Comparing {len(healthy)} method(s) against ground truth ({len(gt_traj['t'])} poses)")
+                for name, traj in sorted(healthy.items()):
+                    comp = evaluate_pair(name, traj, "ground_truth", gt_traj, run_duration)
+                    comp["method"] = name
+                    gt_comparisons.append(comp)
+
+    gt_errors = {
+        comp["method"]: (float(comp.get("rmse", math.inf)), float(comp.get("median", math.inf)))
+        for comp in gt_comparisons
+        if comp.get("method") in healthy and math.isfinite(float(comp.get("rmse", math.inf)))
+    }
+
+    supported = [
+        name
+        for name, count in support.items()
+        if count > 0 and health[name].get("duration_sec", 0.0) >= min_winner_duration
+    ]
     winner = None
     confidence = "none"
     if supported:
@@ -2339,28 +2762,38 @@ def evaluate_agreement(
             supported,
             key=lambda name: (
                 -support[name],
+                gt_errors.get(name, (math.inf, math.inf))[0],
+                gt_errors.get(name, (math.inf, math.inf))[1],
                 float(np.median(errors[name])) if errors[name] else math.inf,
-                -health[name].get("poses", 0),
+                -health[name].get("duration_sec", 0.0),
                 name,
             ),
         )[0]
         confidence = "high" if support[winner] >= 2 else "medium"
     elif allow_unreliable and names:
-        winner = sorted(names, key=lambda name: (-health[name].get("poses", 0), name))[0]
+        winner = sorted(
+            names,
+            key=lambda name: (
+                gt_errors.get(name, (math.inf, math.inf))[0],
+                gt_errors.get(name, (math.inf, math.inf))[1],
+                -health[name].get("poses", 0),
+                name,
+            ),
+        )[0]
         confidence = "low"
 
-    # Compare each healthy candidate against ground truth if available.
-    gt_comparisons: list[dict[str, Any]] = []
-    if dataset is not None and healthy:
-        gt_path = dataset / "groundtruth.txt"
-        if gt_path.exists():
-            gt_traj = read_tum(gt_path)
-            if len(gt_traj["t"]) >= 3:
-                print(f"[pseudo-gt] Comparing {len(healthy)} method(s) against ground truth ({len(gt_traj['t'])} poses)")
-                for name, traj in sorted(healthy.items()):
-                    comp = evaluate_pair(name, traj, "ground_truth", gt_traj, run_duration)
-                    comp["method"] = name
-                    gt_comparisons.append(comp)
+    # Per-method runtime performance extracted from candidate metrics.
+    _timing_keys = [
+        "runtime_fps", "mean_tracking_time_sec", "median_tracking_time_sec",
+        "total_tracking_time_sec", "slam_avg_ms", "odom_avg_ms", "camera_avg_ms",
+        "kp_max_features",
+        "feature_extraction_sec", "sequential_matching_sec", "mapper_sec",
+    ]
+    timing: dict[str, dict[str, Any]] = {}
+    for result in results:
+        m = {k: result.metrics[k] for k in _timing_keys if k in result.metrics}
+        if m:
+            timing[result.method] = m
 
     agreement = {
         "status": "ok" if supported else "agreement_failed",
@@ -2370,6 +2803,7 @@ def evaluate_agreement(
         "health": health,
         "pairwise": pairwise,
         "gt_comparisons": gt_comparisons,
+        "timing": timing,
         "policy": {
             "min_pairs": 30,
             "rmse_max_m": 0.20,
@@ -2441,6 +2875,55 @@ def write_summary(path: Path, agreement: dict[str, Any]) -> None:
             rmse_str = f"{rmse:.4f}m" if rmse is not None else "n/a"
             med_str = f"{median:.4f}m" if median is not None else "n/a"
             lines.append(f"- `{comp['method']}`: rmse={rmse_str} median={med_str} pairs={pairs}")
+    timing = agreement.get("timing", {})
+    if timing:
+        lines.extend(["", "## Runtime Performance (tracking throughput)", ""])
+        for method in sorted(timing):
+            t = timing[method]
+            parts = []
+            fps = t.get("runtime_fps")
+            if fps is not None:
+                parts.append(f"**{fps:.1f} fps**")
+            # ORB-SLAM3 per-frame tracking time
+            mean_t = t.get("mean_tracking_time_sec")
+            med_t = t.get("median_tracking_time_sec")
+            if mean_t is not None:
+                parts.append(f"mean={mean_t*1000:.1f}ms/frame")
+            if med_t is not None:
+                parts.append(f"median={med_t*1000:.1f}ms/frame")
+            # RTAB-Map per-step averages
+            slam_ms = t.get("slam_avg_ms")
+            odom_ms = t.get("odom_avg_ms")
+            cam_ms = t.get("camera_avg_ms")
+            kp = t.get("kp_max_features")
+            if kp is not None:
+                parts.append(f"features={kp}")
+            if slam_ms is not None or odom_ms is not None:
+                step_parts = []
+                if cam_ms is not None:
+                    step_parts.append(f"camera={cam_ms}ms")
+                if odom_ms is not None:
+                    step_parts.append(f"odom={odom_ms}ms")
+                if slam_ms is not None:
+                    step_parts.append(f"slam={slam_ms}ms")
+                parts.append(f"per-step: {', '.join(step_parts)}")
+            total_sec = t.get("total_tracking_time_sec")
+            if total_sec is not None:
+                parts.append(f"total={total_sec:.1f}s")
+            # COLMAP stage timings
+            feat_sec = t.get("feature_extraction_sec")
+            match_sec = t.get("sequential_matching_sec")
+            map_sec = t.get("mapper_sec")
+            if feat_sec is not None or match_sec is not None or map_sec is not None:
+                colmap_parts = []
+                if feat_sec is not None:
+                    colmap_parts.append(f"feat={feat_sec:.0f}s")
+                if match_sec is not None:
+                    colmap_parts.append(f"match={match_sec:.0f}s")
+                if map_sec is not None:
+                    colmap_parts.append(f"map={map_sec:.0f}s")
+                parts.append(f"stages: {', '.join(colmap_parts)}")
+            lines.append(f"- `{method}`: {' | '.join(parts) if parts else 'n/a'}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -2455,13 +2938,81 @@ def write_plots(diagnostics: Path, trajectories: dict[str, dict[str, np.ndarray]
     if not trajectories:
         return
 
+    # Sim3-align all trajectories to a common depth-based reference so that
+    # monocular methods (colmap_sfm) appear at the correct metric scale.
+    # When a trajectory has no temporal overlap with the reference, we align it
+    # transitively through any already-aligned trajectory that does overlap.
+
+    def _try_sim3(src_p: np.ndarray, src_traj: dict, dst_traj: dict):
+        """Return (scale, R, t) aligning src to dst, or None if insufficient overlap."""
+        ia, ib = associate_trajectories(src_traj, dst_traj)
+        if len(ia) < 5:
+            return None
+        try:
+            s, R, t = umeyama_sim3(src_p[ia], dst_traj["p"][ib])
+            return (s, R, t) if 1e-4 < s < 1e4 else None
+        except Exception:
+            return None
+
+    # Pick the reference as the depth-based method that overlaps with the most others.
+    _ref_pref = ["rtabmap_rgbd_imu", "rtabmap_rgbd", "orbslam3_rgbd_imu", "orbslam3_rgbd", "colmap_sfm"]
+
+    def _overlap_count(name: str) -> int:
+        traj = trajectories[name]
+        return sum(
+            1
+            for other, other_traj in trajectories.items()
+            if other != name and len(associate_trajectories(traj, other_traj)[0]) >= 5
+        )
+
+    _ref_pref_present = [n for n in _ref_pref if n in trajectories]
+    if _ref_pref_present:
+        # Among depth-based candidates prefer the one with most overlapping neighbours.
+        ref_name = max(_ref_pref_present, key=_overlap_count)
+    else:
+        ref_name = max(trajectories, key=lambda n: len(trajectories[n]["t"]))
+
+    ref_traj = trajectories[ref_name]
+    # Aligned dict stores trajectories remapped into ref_name's coordinate frame.
+    aligned: dict[str, dict[str, np.ndarray]] = {ref_name: ref_traj}
+
+    # Pass 1: direct alignment to reference.
+    unaligned = {}
+    for name, traj in trajectories.items():
+        if name == ref_name or len(traj["t"]) == 0:
+            continue
+        result = _try_sim3(traj["p"], traj, ref_traj)
+        if result:
+            s, R, t = result
+            aligned[name] = {**traj, "p": apply_sim3(traj["p"], s, R, t)}
+        else:
+            unaligned[name] = traj
+
+    # Pass 2: transitive alignment — align remaining trajectories through any
+    # trajectory that was already aligned in pass 1.
+    for name, traj in unaligned.items():
+        best = None
+        for pivot_name, pivot_traj in aligned.items():
+            if pivot_name == ref_name:
+                continue  # already tried direct alignment to ref
+            result = _try_sim3(traj["p"], traj, pivot_traj)
+            if result:
+                best = result
+                break
+        if best:
+            s, R, t = best
+            aligned[name] = {**traj, "p": apply_sim3(traj["p"], s, R, t)}
+        else:
+            aligned[name] = traj  # give up, show raw
+
     plt.figure(figsize=(8, 6))
-    for name, traj in sorted(trajectories.items()):
+    for name, traj in sorted(aligned.items()):
         if len(traj["p"]):
             plt.plot(traj["p"][:, 0], traj["p"][:, 1], label=name)
     plt.axis("equal")
     plt.xlabel("x")
     plt.ylabel("y")
+    plt.title(f"Sim3-aligned to {ref_name}", fontsize=9)
     plt.legend()
     plt.tight_layout()
     plt.savefig(diagnostics / "trajectory_xy.png")
@@ -2508,6 +3059,12 @@ def persist_outputs(
             shutil.copy2(result.trajectory, dest_dir / "trajectory_tum.csv")
         if result.log is not None and result.log.exists():
             shutil.copy2(result.log, dest_dir / "run.log")
+        if result.method.startswith("rtabmap_") and result.log is not None:
+            candidate_src = result.log.parent
+            for pattern in ("rtabmap.db", "rtabmap_poses.txt", "*_odom.txt", "*_slam.txt", "*_gt.txt", "rtabmap_metrics.json"):
+                for item in sorted(candidate_src.glob(pattern)):
+                    if item.is_file():
+                        shutil.copy2(item, dest_dir / item.name)
 
     diag_src = workspace / "diagnostics"
     if diag_src.exists():
@@ -2543,52 +3100,18 @@ def persist_outputs(
     (output / "run_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def create_synthetic_bag(dataset: Path, workspace: Path, profile: dict[str, Any]) -> Path | None:
-    """Write a ROS2 mcap bag from a normalized dataset so RTAB-Map can replay it."""
-    bag_dir = workspace / "synthetic_bag"
-    if (bag_dir / "metadata.yaml").exists():
-        return bag_dir
-    rgb_topic = (profile.get("rgb_topics") or ["/camera/rgb/image_color"])[0]
-    depth_topic = (profile.get("depth_topics") or ["/camera/depth/image"])[0]
-    info_topic = (profile.get("camera_info_topics") or ["/camera/rgb/camera_info"])[0]
-    log = workspace / "logs" / "synthetic_bag.log"
-    frame_id = profile.get("frame_id", "camera_link")
-    print(f"[pseudo-gt] Creating synthetic ROS2 bag for RTAB-Map from normalized dataset")
-    rc = run(
-        [
-            "python3", "/work/scripts/write_normalized_ros2_bag.py",
-            str(dataset), str(bag_dir),
-            "--rgb-topic", rgb_topic,
-            "--depth-topic", depth_topic,
-            "--info-topic", info_topic,
-            "--frame-id", frame_id,
-        ],
-        log=log,
-    )
-    if rc != 0 or not (bag_dir / "metadata.yaml").exists():
-        print(f"[pseudo-gt] synthetic bag creation failed (rc={rc}); RTAB-Map will be skipped")
-        return None
-    return bag_dir
-
 
 def run_candidates(
     methods: list[str],
-    bag: Path,
-    workspace: Path,
     dataset: Path,
+    workspace: Path,
     profile: dict[str, Any],
     colmap_preset: str,
     colmap_use_gpu: str,
+    rtabmap_preset: str,
     progress: ProgressReporter | None = None,
 ) -> list[CandidateResult]:
     results = []
-    compressed_replay_topics = any(
-        topic and topic.endswith("/compressed")
-        for topic in [
-            profile.get("rgb_topics", [None])[0],
-            profile.get("depth_topics", [None])[0],
-        ]
-    )
     disabled = set(profile.get("disabled_methods", []))
     for method in methods:
         out_dir = workspace / "candidates" / method
@@ -2606,29 +3129,7 @@ def run_candidates(
             continue
         print(f"[pseudo-gt] Running candidate: {method}")
         if method in {"rtabmap_rgbd", "rtabmap_rgbd_imu"}:
-            bag_playable = (
-                bag is not None
-                and bag.exists()
-                and (
-                    (bag.is_file() and bag.suffix in {".bag", ".mcap"})
-                    or (bag.is_dir() and (bag / "metadata.yaml").exists())
-                )
-            )
-            if not bag_playable:
-                log = out_dir / "run.log"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                log.write_text("RTAB-Map requires a playable ROS bag; none available for this input.\n", encoding="utf-8")
-                result = CandidateResult(method, "failed", None, log, {}, "requires ROS bag playback")
-            elif compressed_replay_topics:
-                log = out_dir / "run.log"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                log.write_text(
-                    "RTAB-Map RGB-D odometry expects raw Image topics; skipped because selected bag topics are compressed.\n",
-                    encoding="utf-8",
-                )
-                result = CandidateResult(method, "failed", None, log, {}, "requires raw Image topics")
-            else:
-                result = run_rtabmap_candidate(method, bag, out_dir, profile, progress=progress)
+            result = run_rtabmap_candidate(method, dataset, out_dir, profile, rtabmap_preset, progress=progress)
         elif method == "colmap_sfm":
             result = run_colmap_candidate(dataset, out_dir, colmap_preset, colmap_use_gpu, progress=progress)
         elif method in {"orbslam3_rgbd", "orbslam3_rgbd_imu"}:
@@ -2649,6 +3150,7 @@ def write_extraction_manifest(workspace: Path, extraction: dict[str, Any], profi
         "workspace_mode": args.workspace_mode,
         "target_fps": args.target_fps,
         "max_frames": args.max_frames,
+        "rtabmap_preset": getattr(args, "rtabmap_preset", "default"),
         "extraction": extraction,
     }
     (workspace / "extraction_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -2663,6 +3165,7 @@ def main() -> int:
     parser.add_argument("--methods", default=DEFAULT_METHODS)
     parser.add_argument("--colmap-preset", default="stable", choices=["fast", "stable", "robust"])
     parser.add_argument("--colmap-use-gpu", default=os.environ.get("PSEUDO_GT_COLMAP_USE_GPU", "0"), choices=["0", "1"])
+    parser.add_argument("--rtabmap-preset", default="default", choices=["default", "fast", "robust", "f2f", "dense-keyframes"])
     parser.add_argument("--workspace-mode", default="ram", choices=["ram", "disk"])
     parser.add_argument("--keep-workspace", action="store_true")
     parser.add_argument("--persist-intermediates", action="store_true")
@@ -2684,9 +3187,14 @@ def main() -> int:
     progress = make_progress_reporter(methods)
     ensure_empty_output(output, args.force)
     workspace = make_workspace(output, args.workspace_mode, args.keep_workspace)
+    # Assign a unique ROS domain ID so concurrent pipeline runs on the same host
+    # don't cross-contaminate each other's /rtabmap/odom or other topics.
+    domain_id = random.randint(1, 101)
+    os.environ["ROS_DOMAIN_ID"] = str(domain_id)
     print(f"[pseudo-gt] Workspace: {workspace}")
     print(f"[pseudo-gt] Output: {output}")
     print(f"[pseudo-gt] Input format: {input_format}")
+    print(f"[pseudo-gt] ROS_DOMAIN_ID: {domain_id}")
 
     try:
         dataset = workspace / "dataset"
@@ -2701,6 +3209,9 @@ def main() -> int:
             log_dir=workspace / "logs",
         )
         progress.done("normalize_input")
+        # Create the output dir only after normalize succeeds so that a
+        # normalize crash doesn't leave an empty directory in the output tree.
+        output.mkdir(parents=True, exist_ok=True)
         if extraction.get("rgb_topic"):
             profile["rgb_topics"] = [extraction["rgb_topic"]]
         if extraction.get("depth_topic"):
@@ -2710,17 +3221,19 @@ def main() -> int:
         if "imu_topic" in extraction:
             profile["imu_topics"] = [extraction["imu_topic"]] if extraction["imu_topic"] else []
         write_extraction_manifest(workspace, extraction, profile, args)
-        rtabmap_bag = bag
-        if input_format in {"tum_rgbd", "hypersim"}:
-            rtabmap_bag = create_synthetic_bag(dataset, workspace, profile)
+        # Profile YAML may specify rtabmap_preset to tune speed for a given
+        # camera type (e.g. "fast" for 30fps RealSense). CLI flag always wins.
+        rtabmap_preset = args.rtabmap_preset
+        if rtabmap_preset == "default" and profile.get("rtabmap_preset"):
+            rtabmap_preset = profile["rtabmap_preset"]
         results = run_candidates(
             methods,
-            rtabmap_bag,
-            workspace,
             dataset,
+            workspace,
             profile,
             colmap_preset=args.colmap_preset,
             colmap_use_gpu=args.colmap_use_gpu,
+            rtabmap_preset=rtabmap_preset,
             progress=progress,
         )
         progress.start("agreement")

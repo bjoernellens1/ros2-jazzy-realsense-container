@@ -3,9 +3,18 @@ profiles:
     storage: tum_rgbd
     association_max_dt: 0.05
     depth_factor: 5000.0
+    frame_id: camera_link
+    # Topics used when a synthetic ROS2 bag is generated for RTAB-Map playback
+    rgb_topics:
+      - /camera/rgb/image_color
+    depth_topics:
+      - /camera/depth/image
+    camera_info_topics:
+      - /camera/rgb/camera_info
 
   realsense_d435i_ros1:
     storage: realsense_ros1_bag
+    rtabmap_preset: fast      # 30fps input; default (500 feat) exceeds 50ms budget
     camera_name: camera
     frame_id: camera_link
     rgb_topics:
@@ -25,9 +34,22 @@ profiles:
     association_max_dt: 0.05
     min_association_ratio: 0.8
     depth_factor: 1000.0
+    orbslam3_rgbd_imu:
+      # ORB-SLAM3's D435i sample extrinsics/noise. Replace with calibrated
+      # camera-to-IMU values before treating RGB-D-inertial output as reliable.
+      T_b_c1: [0.999903, -0.0138036, -0.00208099, -0.0202141,
+               0.0137985, 0.999902, -0.00243498, 0.00505961,
+               0.0021144, 0.00240603, 0.999995, 0.0114047,
+               0.0, 0.0, 0.0, 1.0]
+      noise_gyro: 0.01
+      noise_acc: 0.1
+      gyro_walk: 0.000001
+      acc_walk: 0.0001
+      frequency: 200.0
 
   realsense_d435i_ros2:
     storage: rosbag2
+    rtabmap_preset: fast      # 30fps input; default (500 feat) exceeds 50ms budget
     camera_name: camera
     frame_id: camera_link
     rgb_topics:
@@ -51,6 +73,32 @@ profiles:
     association_max_dt: 0.05
     min_association_ratio: 0.8
     depth_factor: 1000.0
+    orbslam3_rgbd_imu:
+      T_b_c1: [0.999903, -0.0138036, -0.00208099, -0.0202141,
+               0.0137985, 0.999902, -0.00243498, 0.00505961,
+               0.0021144, 0.00240603, 0.999995, 0.0114047,
+               0.0, 0.0, 0.0, 1.0]
+      noise_gyro: 0.01
+      noise_acc: 0.1
+      gyro_walk: 0.000001
+      acc_walk: 0.0001
+      frequency: 200.0
+
+  hypersim:
+    storage: hypersim
+    depth_factor: 1000.0
+    frame_time_seconds: 1.0
+    frame_id: camera_link
+    # Scene selection matters: ai_024_xxx and ai_026_xxx scenes have
+    # ~0.03 m/frame (suitable for ORB-SLAM3).  Fast flythrough scenes
+    # (ai_001_001, most others) average ~1 m/frame and only COLMAP works.
+    # Topics used when a synthetic ROS2 bag is generated for RTAB-Map playback
+    rgb_topics:
+      - /camera/rgb/image_color
+    depth_topics:
+      - /camera/depth/image
+    camera_info_topics:
+      - /camera/rgb/camera_info
 
   orbbec_femto_bolt_ros2:
     storage: rosbag2
