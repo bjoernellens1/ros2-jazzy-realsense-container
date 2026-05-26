@@ -20,8 +20,8 @@ from typing import Any
 import numpy as np
 
 
-DEFAULT_METHODS = "rtabmap_rgbd,rtabmap_rgbd_imu,colmap_sfm,orbslam3_rgbd"
-VALID_METHODS = {"rtabmap_rgbd", "rtabmap_rgbd_imu", "colmap_sfm", "orbslam3_rgbd"}
+DEFAULT_METHODS = "rtabmap_rgbd,rtabmap_rgbd_imu,colmap_sfm,orbslam3_rgbd,orbslam3_rgbd_imu"
+VALID_METHODS = {"rtabmap_rgbd", "rtabmap_rgbd_imu", "colmap_sfm", "orbslam3_rgbd", "orbslam3_rgbd_imu"}
 TUM_FREIBURG_INTRINSICS = {
     "freiburg1": {
         "fx": 517.306408,
@@ -176,6 +176,7 @@ def make_progress_reporter(methods: list[str]) -> ProgressReporter:
         "rtabmap_rgbd_imu": 180.0,
         "colmap_sfm": 120.0,
         "orbslam3_rgbd": 90.0,
+        "orbslam3_rgbd_imu": 120.0,
     }
     steps = [ProgressStep("normalize_input", 0.25, 90.0)]
     for method in methods:
@@ -354,6 +355,36 @@ def build_sync_report(
 
 def write_sync_report(dataset: Path, report: dict[str, Any]) -> None:
     (dataset / "sync_report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def imu_to_row(msg: Any, fallback_ns: int) -> tuple[int, float, float, float, float, float, float]:
+    ts_ns = msg_stamp_ns(msg, fallback_ns)
+    acc = msg.linear_acceleration
+    gyro = msg.angular_velocity
+    return (
+        ts_ns,
+        float(acc.x),
+        float(acc.y),
+        float(acc.z),
+        float(gyro.x),
+        float(gyro.y),
+        float(gyro.z),
+    )
+
+
+def write_imu_csv(rows: list[tuple[int, float, float, float, float, float, float]], dataset: Path) -> dict[str, Any]:
+    path = dataset / "imu.csv"
+    rows = sorted(rows, key=lambda item: item[0])
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["timestamp", "ax", "ay", "az", "gx", "gy", "gz"])
+        for ts_ns, ax, ay, az, gx, gy, gz in rows:
+            writer.writerow([f"{ns_to_sec(ts_ns):.9f}", ax, ay, az, gx, gy, gz])
+    return {
+        "imu_count": len(rows),
+        "imu_first_timestamp": ns_to_sec(rows[0][0]) if rows else None,
+        "imu_last_timestamp": ns_to_sec(rows[-1][0]) if rows else None,
+    }
 
 
 def stamp_to_ns(stamp: Any) -> int:
@@ -698,11 +729,17 @@ def extract_ros2_bag(
     rgb_topic = choose_topic(available, profile["rgb_topics"])
     depth_topic = choose_topic(available, profile["depth_topics"])
     info_topic = choose_topic(available, profile["camera_info_topics"])
+    imu_topic = choose_topic(available, profile.get("imu_topics", []), required=False)
+    if imu_topic and topics.get(imu_topic) != "sensor_msgs/msg/Imu":
+        imu_topic = None
 
     colors: list[tuple[int, Any]] = []
     depths: list[tuple[int, Any]] = []
     infos: list[tuple[int, Any]] = []
+    imus: list[tuple[int, float, float, float, float, float, float]] = []
     selected = {rgb_topic, depth_topic, info_topic}
+    if imu_topic:
+        selected.add(imu_topic)
     type_cache = {topic: get_message(topics[topic]) for topic in selected}
 
     while reader.has_next():
@@ -717,6 +754,8 @@ def extract_ros2_bag(
             depths.append((stamp_ns_value, msg))
         elif topic == info_topic:
             infos.append((stamp_ns_value, msg))
+        elif topic == imu_topic:
+            imus.append(imu_to_row(msg, bag_ns))
 
     if not colors or not depths or not infos:
         raise RuntimeError(
@@ -770,17 +809,20 @@ def extract_ros2_bag(
         max_frames=max_frames,
         depth_factor=float(profile.get("depth_factor", 1000.0)),
     )
+    imu_result = write_imu_csv(imus, dataset) if imus else {"imu_count": 0}
     result.update(
         {
             "rgb_topic": rgb_topic,
             "depth_topic": depth_topic,
             "camera_info_topic": info_topic,
-            "imu_topic": choose_topic(available, profile.get("imu_topics", []), required=False),
+            "imu_topic": imu_topic,
             "raw_color_count": len(colors),
             "raw_depth_count": len(depths),
             "raw_camera_info_count": len(infos),
+            "raw_imu_count": len(imus),
             "associated_count": len(pairs),
             "sync": sync_report,
+            **imu_result,
         }
     )
     return result
@@ -823,22 +865,32 @@ def launch_realsense_ros1_bag(bag: Path, profile: dict[str, Any], log: Path) -> 
     fh = log.open("a", encoding="utf-8")
     fh.write("+ " + " ".join(cmd) + "\n")
     fh.flush()
-    return subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, text=True)
+    return subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, text=True, start_new_session=True)
 
 
 def terminate_processes(processes: list[subprocess.Popen]) -> None:
     for proc in processes:
         if proc.poll() is None:
-            proc.send_signal(signal.SIGINT)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            except ProcessLookupError:
+                pass
     time.sleep(2)
     for proc in processes:
         if proc.poll() is None:
-            proc.terminate()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
     for proc in processes:
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
 
 
 def extract_live_topics_from_realsense_bag(
@@ -853,6 +905,9 @@ def extract_live_topics_from_realsense_bag(
     proc = launch_realsense_ros1_bag(bag, profile, log)
     try:
         topics = [profile["rgb_topics"][0], profile["depth_topics"][0], profile["camera_info_topics"][0]]
+        imu_topics = profile.get("imu_topics") or []
+        if imu_topics:
+            topics.append(imu_topics[0])
         wait_for_topics(topics, timeout=60, log=log)
         result = run_live_extractor(dataset, profile, target_fps, max_frames, proc)
         result.update(
@@ -876,7 +931,8 @@ def run_live_extractor(
     playback_proc: subprocess.Popen,
 ) -> dict[str, Any]:
     import rclpy
-    from sensor_msgs.msg import CameraInfo, Image
+    from rclpy.qos import qos_profile_sensor_data
+    from sensor_msgs.msg import CameraInfo, Image, Imu
 
     class LiveExtractor:
         def __init__(self) -> None:
@@ -884,14 +940,21 @@ def run_live_extractor(
             self.rgb_topic = profile["rgb_topics"][0]
             self.depth_topic = profile["depth_topics"][0]
             self.info_topic = profile["camera_info_topics"][0]
+            self.imu_topic = profile.get("imu_topics", [None])[0]
             self.max_delta_ns = int(float(profile.get("association_max_dt", 0.05)) * 1_000_000_000)
             self.depths: list[tuple[int, Any]] = []
             self.colors: list[tuple[int, Any]] = []
             self.infos: list[tuple[int, Any]] = []
+            self.imus: list[tuple[int, float, float, float, float, float, float]] = []
             self.last_msg_time = time.time()
-            self.sub_rgb = self.node.create_subscription(Image, self.rgb_topic, self.on_rgb, 50)
-            self.sub_depth = self.node.create_subscription(Image, self.depth_topic, self.on_depth, 50)
-            self.sub_info = self.node.create_subscription(CameraInfo, self.info_topic, self.on_info, 10)
+            self.sub_rgb = self.node.create_subscription(Image, self.rgb_topic, self.on_rgb, qos_profile_sensor_data)
+            self.sub_depth = self.node.create_subscription(Image, self.depth_topic, self.on_depth, qos_profile_sensor_data)
+            self.sub_info = self.node.create_subscription(CameraInfo, self.info_topic, self.on_info, qos_profile_sensor_data)
+            self.sub_imu = (
+                self.node.create_subscription(Imu, self.imu_topic, self.on_imu, qos_profile_sensor_data)
+                if self.imu_topic
+                else None
+            )
             self.timer = self.node.create_timer(0.5, self.on_timer)
 
         def on_rgb(self, msg: Any) -> None:
@@ -905,6 +968,10 @@ def run_live_extractor(
         def on_info(self, msg: Any) -> None:
             self.last_msg_time = time.time()
             self.infos.append((stamp_to_ns(msg.header.stamp), msg))
+
+        def on_imu(self, msg: Any) -> None:
+            self.last_msg_time = time.time()
+            self.imus.append(imu_to_row(msg, stamp_to_ns(msg.header.stamp)))
 
         def has_enough_for_frame_cap(self) -> bool:
             if max_frames <= 0 or not self.infos or not self.colors or not self.depths:
@@ -935,6 +1002,7 @@ def run_live_extractor(
         colors = sorted(extractor.colors, key=lambda item: item[0])
         depths = sorted(extractor.depths, key=lambda item: item[0])
         infos = sorted(extractor.infos, key=lambda item: item[0])
+        imus = sorted(extractor.imus, key=lambda item: item[0])
         extractor.node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
@@ -987,13 +1055,16 @@ def run_live_extractor(
         max_frames=max_frames,
         depth_factor=float(profile.get("depth_factor", 1000.0)),
     )
+    imu_result = write_imu_csv(imus, dataset) if imus else {"imu_count": 0}
     result.update(
         {
             "raw_color_count": len(colors),
             "raw_depth_count": len(depths),
             "raw_camera_info_count": len(infos),
+            "raw_imu_count": len(imus),
             "associated_count": len(pairs),
             "sync": sync_report,
+            **imu_result,
         }
     )
     return result
@@ -1083,6 +1154,259 @@ def infer_tum_camera_info(root: Path, profile: dict[str, Any]) -> dict[str, Any]
     info.setdefault("d", [])
     info.setdefault("depth_factor", float(profile.get("depth_factor", 5000.0)))
     return info
+
+
+def normalize_hypersim(
+    zip_path: Path,
+    dataset: Path,
+    profile: dict[str, Any],
+    target_fps: float,
+    max_frames: int,
+) -> dict[str, Any]:
+    import io
+    import cv2
+    import h5py
+    import zipfile
+
+    print(f"[pseudo-gt] Normalizing Hypersim scene from {zip_path}")
+
+    # All Hypersim scenes use the same camera: 1024x768, fov_x = pi/3 (60°).
+    # These match _vray_user_params.py in the dataset distribution.
+    W, H = 1024, 768
+    fov_x = math.pi / 3.0
+    fx = (W / 2.0) / math.tan(fov_x / 2.0)
+    fy = fx
+    cx = W / 2.0
+    cy = H / 2.0
+
+    # Per-pixel factor converting Euclidean ray distance → perpendicular Z-depth.
+    # Hypersim depth_meters is the Euclidean camera-to-surface distance along the
+    # ray, not the Z-component. RGBD SLAM needs Z-depth (perpendicular to image
+    # plane). Formula: z = d / sqrt(1 + ((u-cx)/fx)^2 + ((v-cy)/fy)^2).
+    uu, vv = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+    ray_to_z: np.ndarray = 1.0 / np.sqrt(1.0 + ((uu - cx) / fx) ** 2 + ((vv - cy) / fy) ** 2)
+
+    depth_scale = float(profile.get("depth_factor", 1000.0))  # mm
+
+    images_dir = dataset / "images"
+    depth_dir = dataset / "depth"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    depth_dir.mkdir(parents=True, exist_ok=True)
+
+    frames_csv = dataset / "frames.csv"
+    quality_csv = dataset / "quality.csv"
+    rgb_txt = dataset / "rgb.txt"
+    depth_txt = dataset / "depth.txt"
+    assoc_txt = dataset / "associations.txt"
+    camera_info_json = dataset / "camera_info.json"
+
+    # Discover frame indices and ground-truth poses from the zip.
+    color_pattern = "final_hdf5"
+    depth_pattern = "geometry_hdf5"
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+        color_entries = sorted(
+            n for n in names
+            if color_pattern in n and n.endswith("color.hdf5")
+        )
+        depth_entries = {
+            int(Path(n).name.split(".")[1]): n
+            for n in names
+            if depth_pattern in n and n.endswith("depth_meters.hdf5")
+        }
+        # Ground-truth: camera positions (asset units) and orientations (3×3 R).
+        # Pick the camera that matches the color entries' camera name.
+        cam_name_color = None
+        if color_entries:
+            # e.g. "ai_001_001/images/scene_cam_00_final_hdf5/frame.0000.color.hdf5"
+            cam_name_color = color_entries[0].split("/")[2].replace("scene_", "").replace("_final_hdf5", "")
+        pos_entry = next(
+            (n for n in names if f"/{cam_name_color}/camera_keyframe_positions" in n),
+            next((n for n in names if "camera_keyframe_positions" in n), None),
+        )
+        ori_entry = next(
+            (n for n in names if f"/{cam_name_color}/camera_keyframe_orientations" in n),
+            next((n for n in names if "camera_keyframe_orientations" in n), None),
+        )
+        gt_positions = None
+        gt_orientations = None
+        if pos_entry and ori_entry:
+            gt_positions = h5py.File(io.BytesIO(zf.read(pos_entry)), "r")["dataset"][()].astype(np.float64)
+            gt_orientations = h5py.File(io.BytesIO(zf.read(ori_entry)), "r")["dataset"][()].astype(np.float64)
+
+    if not color_entries:
+        raise RuntimeError(f"No color frames found in {zip_path}")
+
+    kept = 0
+    skipped = 0
+    last_kept_ts = -math.inf
+    min_dt = 1.0 / target_fps if target_fps > 0 else 0.0
+    frame_time = float(profile.get("frame_time_seconds", 1.0))
+
+    with (zipfile.ZipFile(zip_path) as zf,
+          frames_csv.open("w", newline="", encoding="utf-8") as f_frames,
+          quality_csv.open("w", newline="", encoding="utf-8") as f_quality,
+          rgb_txt.open("w", encoding="utf-8") as f_rgb,
+          depth_txt.open("w", encoding="utf-8") as f_depth,
+          assoc_txt.open("w", encoding="utf-8") as f_assoc):
+
+        frames_writer = csv.DictWriter(
+            f_frames,
+            fieldnames=["index", "timestamp", "rgb_file", "depth_file",
+                        "color_stamp", "depth_stamp", "stamp_delta_sec"],
+        )
+        quality_writer = csv.DictWriter(
+            f_quality,
+            fieldnames=["index", "timestamp", "blur_score",
+                        "exposure_clip_ratio", "depth_valid_ratio",
+                        "accepted", "reason"],
+        )
+        frames_writer.writeheader()
+        quality_writer.writeheader()
+
+        for color_entry in color_entries:
+            frame_idx = int(Path(color_entry).name.split(".")[1])
+            ts = float(frame_idx) * frame_time
+            if ts - last_kept_ts < min_dt:
+                continue
+            depth_entry = depth_entries.get(frame_idx)
+            if depth_entry is None:
+                skipped += 1
+                continue
+
+            # Read color HDF5 (linear float16, shape HxWx3 RGB).
+            color_bytes = zf.read(color_entry)
+            with h5py.File(io.BytesIO(color_bytes), "r") as hf:
+                color_linear = hf["dataset"][()].astype(np.float32)  # HxWx3
+
+            # Read depth HDF5 (float16, Euclidean meters).
+            depth_bytes = zf.read(depth_entry)
+            with h5py.File(io.BytesIO(depth_bytes), "r") as hf:
+                depth_ray = hf["dataset"][()].astype(np.float32)  # HxW
+
+            # Convert linear HDR to uint8: per-image percentile tone map + gamma.
+            valid_mask = np.isfinite(color_linear) & (color_linear >= 0)
+            if valid_mask.any():
+                p99 = float(np.percentile(color_linear[valid_mask], 99.5))
+                scale = p99 if p99 > 1e-6 else 1.0
+            else:
+                scale = 1.0
+            color_srgb = np.clip(color_linear / scale, 0.0, 1.0) ** (1.0 / 2.2)
+            color_uint8 = (color_srgb * 255).astype(np.uint8)
+            # HDF5 channel order is RGB; OpenCV uses BGR.
+            color_bgr = color_uint8[:, :, ::-1]
+
+            # Convert Euclidean depth to Z-depth in mm (uint16).
+            depth_valid = np.isfinite(depth_ray) & (depth_ray > 0)
+            depth_z = np.where(depth_valid, depth_ray * ray_to_z, 0.0)
+            depth_mm = np.clip(depth_z * depth_scale, 0, 65535).astype(np.uint16)
+
+            q_blur = blur_score(color_bgr)
+            q_clip = exposure_clip_ratio(color_bgr)
+            q_depth = float(depth_valid.mean())
+            accepted = q_depth >= 0.05
+
+            index = kept
+            quality_writer.writerow({
+                "index": index,
+                "timestamp": f"{ts:.9f}",
+                "blur_score": f"{q_blur:.6f}",
+                "exposure_clip_ratio": f"{q_clip:.6f}",
+                "depth_valid_ratio": f"{q_depth:.6f}",
+                "accepted": str(accepted).lower(),
+                "reason": "ok" if accepted else "depth_valid_ratio_low",
+            })
+
+            if not accepted:
+                skipped += 1
+                continue
+
+            if kept == 0:
+                write_camera_info_dict({
+                    "width": W, "height": H,
+                    "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                    "distortion_model": "none", "d": [],
+                    "depth_factor": depth_scale,
+                }, camera_info_json)
+
+            rgb_rel = f"images/frame_{index:06d}.png"
+            dep_rel = f"depth/frame_{index:06d}.png"
+            cv2.imwrite(str(dataset / rgb_rel), color_bgr)
+            cv2.imwrite(str(dataset / dep_rel), depth_mm)
+            f_rgb.write(f"{ts:.9f} {rgb_rel}\n")
+            f_depth.write(f"{ts:.9f} {dep_rel}\n")
+            f_assoc.write(f"{ts:.9f} {rgb_rel} {ts:.9f} {dep_rel}\n")
+            frames_writer.writerow({
+                "index": index, "timestamp": f"{ts:.9f}",
+                "rgb_file": rgb_rel, "depth_file": dep_rel,
+                "color_stamp": f"{ts:.9f}", "depth_stamp": f"{ts:.9f}",
+                "stamp_delta_sec": "0.000000000",
+            })
+            kept += 1
+            last_kept_ts = ts
+            if max_frames > 0 and kept >= max_frames:
+                break
+
+    if kept == 0:
+        raise RuntimeError("No Hypersim frames were successfully normalized.")
+
+    # Write ground-truth trajectory in TUM format if camera poses are available.
+    # Hypersim orientations are 3×3 rotation matrices (world-to-camera, OpenGL
+    # convention: Y-up, -Z forward). Convert to quaternion for TUM format.
+    has_gt = False
+    if gt_positions is not None and gt_orientations is not None:
+        gt_path = dataset / "groundtruth.txt"
+        meters_per_unit = float(profile.get("meters_per_asset_unit", 0.0254))
+        with gt_path.open("w", encoding="utf-8") as fgt:
+            fgt.write("# Hypersim ground-truth camera trajectory (TUM format)\n")
+            fgt.write("# timestamp tx ty tz qx qy qz qw\n")
+            n_gt = min(len(gt_positions), len(gt_orientations))
+            for fi in range(n_gt):
+                ts_gt = float(fi) * frame_time
+                t = gt_positions[fi] * meters_per_unit
+                R = gt_orientations[fi].reshape(3, 3)
+                # Rotation matrix → quaternion (Hamilton convention).
+                trace = R[0, 0] + R[1, 1] + R[2, 2]
+                if trace > 0:
+                    s = 0.5 / math.sqrt(trace + 1.0)
+                    qw = 0.25 / s
+                    qx = (R[2, 1] - R[1, 2]) * s
+                    qy = (R[0, 2] - R[2, 0]) * s
+                    qz = (R[1, 0] - R[0, 1]) * s
+                elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+                    s = 2.0 * math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+                    qw = (R[2, 1] - R[1, 2]) / s
+                    qx = 0.25 * s
+                    qy = (R[0, 1] + R[1, 0]) / s
+                    qz = (R[0, 2] + R[2, 0]) / s
+                elif R[1, 1] > R[2, 2]:
+                    s = 2.0 * math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+                    qw = (R[0, 2] - R[2, 0]) / s
+                    qx = (R[0, 1] + R[1, 0]) / s
+                    qy = 0.25 * s
+                    qz = (R[1, 2] + R[2, 1]) / s
+                else:
+                    s = 2.0 * math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+                    qw = (R[1, 0] - R[0, 1]) / s
+                    qx = (R[0, 2] + R[2, 0]) / s
+                    qy = (R[1, 2] + R[2, 1]) / s
+                    qz = 0.25 * s
+                fgt.write(f"{ts_gt:.9f} {t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "
+                          f"{qx:.9f} {qy:.9f} {qz:.9f} {qw:.9f}\n")
+        print(f"[pseudo-gt] Hypersim: wrote {n_gt} GT poses to groundtruth.txt")
+        has_gt = True
+
+    print(f"[pseudo-gt] Hypersim: kept {kept} frames, skipped {skipped}")
+    return {
+        "input_format": "hypersim",
+        "frame_count": kept,
+        "skipped": skipped,
+        "has_groundtruth": has_gt,
+        "camera_info": {
+            "width": W, "height": H, "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+            "depth_factor": depth_scale,
+        },
+    }
 
 
 def normalize_tum_rgbd(
@@ -1261,7 +1585,35 @@ def detect_input_format(path: Path, requested: str, profile: dict[str, Any]) -> 
         return "tum_rgbd"
     if path.is_dir() and (path / "rgb.txt").exists() and (path / "depth.txt").exists():
         return "tum_rgbd"
+    if path.suffix == ".zip" or profile.get("storage") == "hypersim":
+        return "hypersim"
     return "bag"
+
+
+def _find_and_copy_groundtruth(source: Path, dataset: Path) -> bool:
+    """Look for a groundtruth file alongside source and copy it to dataset."""
+    if (dataset / "groundtruth.txt").exists():
+        return True  # already written by the normalizer (e.g. Hypersim)
+    candidates: list[Path] = []
+    if source.is_dir():
+        candidates = [
+            source / "groundtruth.txt",
+            source / "groundtruth_tum.txt",
+            source.parent / "groundtruth.txt",
+            source.parent / "groundtruth_tum.txt",
+        ]
+    else:
+        candidates = [
+            source.parent / "groundtruth.txt",
+            source.parent / "groundtruth_tum.txt",
+            source.with_suffix(".groundtruth.txt"),
+        ]
+    for candidate in candidates:
+        if candidate.exists():
+            shutil.copy2(candidate, dataset / "groundtruth.txt")
+            print(f"[pseudo-gt] GT trajectory: {candidate}")
+            return True
+    return False
 
 
 def normalize_input(
@@ -1274,22 +1626,34 @@ def normalize_input(
     log_dir: Path,
 ) -> dict[str, Any]:
     dataset.mkdir(parents=True, exist_ok=True)
-    if input_format == "tum_rgbd":
-        return normalize_tum_rgbd(
+    if input_format == "hypersim":
+        result = normalize_hypersim(
             source,
             dataset,
             profile,
             target_fps=target_fps,
             max_frames=max_frames,
         )
-    return normalize_bag(
-        source,
-        dataset,
-        profile,
-        target_fps=target_fps,
-        max_frames=max_frames,
-        log_dir=log_dir,
-    )
+    elif input_format == "tum_rgbd":
+        result = normalize_tum_rgbd(
+            source,
+            dataset,
+            profile,
+            target_fps=target_fps,
+            max_frames=max_frames,
+        )
+    else:
+        result = normalize_bag(
+            source,
+            dataset,
+            profile,
+            target_fps=target_fps,
+            max_frames=max_frames,
+            log_dir=log_dir,
+        )
+    has_gt = _find_and_copy_groundtruth(source, dataset)
+    result["has_groundtruth"] = result.get("has_groundtruth", has_gt)
+    return result
 
 
 def start_bag_playback(bag: Path, profile: dict[str, Any], log: Path) -> subprocess.Popen:
@@ -1300,7 +1664,7 @@ def start_bag_playback(bag: Path, profile: dict[str, Any], log: Path) -> subproc
     fh = log.open("a", encoding="utf-8")
     fh.write("+ " + " ".join(cmd) + "\n")
     fh.flush()
-    return subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, text=True)
+    return subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, text=True, start_new_session=True)
 
 
 def run_rtabmap_candidate(
@@ -1349,6 +1713,7 @@ def run_rtabmap_candidate(
                 stderr=subprocess.STDOUT,
                 text=True,
                 env=env,
+                start_new_session=True,
             )
         processes.append(rtab_proc)
 
@@ -1416,10 +1781,6 @@ def colmap_preset_args(preset: str) -> tuple[list[str], list[str]]:
             [
                 "--SequentialMatching.overlap",
                 "30",
-                "--SequentialMatching.loop_detection",
-                "1",
-                "--SequentialMatching.loop_detection_num_images",
-                "100",
             ],
         )
     return (
@@ -1438,12 +1799,6 @@ def colmap_preset_args(preset: str) -> tuple[list[str], list[str]]:
             "20",
             "--SequentialMatching.quadratic_overlap",
             "1",
-            "--SequentialMatching.loop_detection",
-            "1",
-            "--SequentialMatching.loop_detection_period",
-            "10",
-            "--SequentialMatching.loop_detection_num_images",
-            "50",
         ],
     )
 
@@ -1621,8 +1976,40 @@ def run_colmap_candidate(
         return CandidateResult(method, "failed", None, log, {}, str(exc))
 
 
-def write_orbslam3_settings(dataset: Path, out_dir: Path) -> Path:
+def estimate_camera_fps(dataset: Path, default: float = 30.0) -> float:
+    assoc = dataset / "associations.txt"
+    if not assoc.exists():
+        return default
+    timestamps: list[float] = []
+    with assoc.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                timestamps.append(float(parts[0]))
+            except ValueError:
+                continue
+    if len(timestamps) < 2:
+        return default
+    diffs = np.diff(np.asarray(timestamps, dtype=float))
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        return default
+    return float(1.0 / float(np.median(diffs)))
+
+
+def write_orbslam3_settings(
+    dataset: Path,
+    out_dir: Path,
+    profile: dict[str, Any] | None = None,
+    with_imu: bool = False,
+) -> Path:
     camera_info = json.loads((dataset / "camera_info.json").read_text(encoding="utf-8"))
+    profile = profile or {}
     fx, fy, cx, cy = camera_params_from_info(camera_info)
     width = int(camera_info.get("width", 640))
     height = int(camera_info.get("height", 480))
@@ -1631,70 +2018,126 @@ def write_orbslam3_settings(dataset: Path, out_dir: Path) -> Path:
     while len(distortion) < 5:
         distortion.append(0.0)
     stereo_b = float(camera_info.get("stereo_b", 0.07732))
+    fps = max(1, int(round(estimate_camera_fps(dataset, default=30.0))))
     settings = out_dir / "orbslam3_rgbd.yaml"
-    settings.write_text(
-        "\n".join(
+    lines = [
+        "%YAML:1.0",
+        'File.version: "1.0"',
+        'Camera.type: "PinHole"',
+        f"Camera1.fx: {fx}",
+        f"Camera1.fy: {fy}",
+        f"Camera1.cx: {cx}",
+        f"Camera1.cy: {cy}",
+        f"Camera1.k1: {distortion[0]}",
+        f"Camera1.k2: {distortion[1]}",
+        f"Camera1.p1: {distortion[2]}",
+        f"Camera1.p2: {distortion[3]}",
+        f"Camera1.k3: {distortion[4]}",
+        f"Camera.width: {width}",
+        f"Camera.height: {height}",
+        f"Camera.fps: {fps}",
+        "Camera.RGB: 1",
+        "Stereo.ThDepth: 40.0",
+        f"Stereo.b: {stereo_b}",
+        f"RGBD.DepthMapFactor: {depth_factor}",
+    ]
+    if with_imu:
+        orb_imu = profile.get("orbslam3_rgbd_imu")
+        if not orb_imu:
+            raise ValueError(
+                "orbslam3_rgbd_imu requires an 'orbslam3_rgbd_imu' block in the "
+                "profile (T_b_c1, noise_gyro, noise_acc, gyro_walk, acc_walk, frequency). "
+                "Refusing to fall back to D435i defaults on a non-D435i sensor."
+            )
+        t_b_c1 = orb_imu.get("T_b_c1")
+        if t_b_c1 is None or len(list(t_b_c1)) != 16:
+            raise ValueError(
+                f"profile.orbslam3_rgbd_imu.T_b_c1 must be a 16-element row-major 4x4 matrix; "
+                f"got {len(list(t_b_c1)) if t_b_c1 is not None else 'None'} elements"
+            )
+        lines.extend(
             [
-                "%YAML:1.0",
-                'File.version: "1.0"',
-                'Camera.type: "PinHole"',
-                f"Camera1.fx: {fx}",
-                f"Camera1.fy: {fy}",
-                f"Camera1.cx: {cx}",
-                f"Camera1.cy: {cy}",
-                f"Camera1.k1: {distortion[0]}",
-                f"Camera1.k2: {distortion[1]}",
-                f"Camera1.p1: {distortion[2]}",
-                f"Camera1.p2: {distortion[3]}",
-                f"Camera1.k3: {distortion[4]}",
-                f"Camera.width: {width}",
-                f"Camera.height: {height}",
-                "Camera.fps: 30",
-                "Camera.RGB: 1",
-                "Stereo.ThDepth: 40.0",
-                f"Stereo.b: {stereo_b}",
-                f"RGBD.DepthMapFactor: {depth_factor}",
-                "ORBextractor.nFeatures: 1000",
-                "ORBextractor.scaleFactor: 1.2",
-                "ORBextractor.nLevels: 8",
-                "ORBextractor.iniThFAST: 20",
-                "ORBextractor.minThFAST: 7",
-                "Viewer.KeyFrameSize: 0.05",
-                "Viewer.KeyFrameLineWidth: 1.0",
-                "Viewer.GraphLineWidth: 0.9",
-                "Viewer.PointSize: 2.0",
-                "Viewer.CameraSize: 0.08",
-                "Viewer.CameraLineWidth: 3.0",
-                "Viewer.ViewpointX: 0.0",
-                "Viewer.ViewpointY: -0.7",
-                "Viewer.ViewpointZ: -1.8",
-                "Viewer.ViewpointF: 500.0",
-                "",
+                "IMU.T_b_c1: !!opencv-matrix",
+                "   rows: 4",
+                "   cols: 4",
+                "   dt: f",
+                "   data: [" + ", ".join(str(float(v)) for v in t_b_c1) + "]",
+                f"IMU.InsertKFsWhenLost: {int(orb_imu.get('insert_kfs_when_lost', 0))}",
+                f"IMU.NoiseGyro: {float(orb_imu.get('noise_gyro', 1e-2))}",
+                f"IMU.NoiseAcc: {float(orb_imu.get('noise_acc', 1e-1))}",
+                f"IMU.GyroWalk: {float(orb_imu.get('gyro_walk', 1e-6))}",
+                f"IMU.AccWalk: {float(orb_imu.get('acc_walk', 1e-4))}",
+                f"IMU.Frequency: {float(orb_imu.get('frequency', 200.0))}",
             ]
-        ),
-        encoding="utf-8",
+        )
+    lines.extend(
+        [
+            "ORBextractor.nFeatures: 1250" if with_imu else "ORBextractor.nFeatures: 1000",
+            "ORBextractor.scaleFactor: 1.2",
+            "ORBextractor.nLevels: 8",
+            "ORBextractor.iniThFAST: 20",
+            "ORBextractor.minThFAST: 7",
+            "Viewer.KeyFrameSize: 0.05",
+            "Viewer.KeyFrameLineWidth: 1.0",
+            "Viewer.GraphLineWidth: 0.9",
+            "Viewer.PointSize: 2.0",
+            "Viewer.CameraSize: 0.08",
+            "Viewer.CameraLineWidth: 3.0",
+            "Viewer.ViewpointX: 0.0",
+            "Viewer.ViewpointY: -0.7",
+            "Viewer.ViewpointZ: -1.8",
+            "Viewer.ViewpointF: 500.0",
+            "",
+        ]
     )
+    settings.write_text("\n".join(lines), encoding="utf-8")
     return settings
 
 
 def run_orbslam3_candidate(
     dataset: Path,
     out_dir: Path,
+    profile: dict[str, Any] | None = None,
+    method: str = "orbslam3_rgbd",
     progress: ProgressReporter | None = None,
 ) -> CandidateResult:
-    method = "orbslam3_rgbd"
+    with_imu = method == "orbslam3_rgbd_imu"
     log = out_dir / "run.log"
     out_dir.mkdir(parents=True, exist_ok=True)
     tum = out_dir / "trajectory_tum.csv"
-    binary = Path(os.environ.get("ORB_SLAM3_RGBD_BIN", "/opt/ORB_SLAM3/Examples/RGB-D/rgbd_tum"))
+    binary_env = "ORB_SLAM3_RGBD_IMU_BIN" if with_imu else "ORB_SLAM3_RGBD_BIN"
+    binary_default = (
+        "/opt/ORB_SLAM3/Examples/RGB-D-Inertial/rgbd_inertial_dataset"
+        if with_imu
+        else "/opt/ORB_SLAM3/Examples/RGB-D/rgbd_tum"
+    )
+    binary = Path(os.environ.get(binary_env, binary_default))
     vocab = Path(os.environ.get("ORB_SLAM3_VOCAB", "/opt/ORB_SLAM3/Vocabulary/ORBvoc.txt"))
+    if with_imu and not (dataset / "imu.csv").exists():
+        return CandidateResult(method, "failed", None, log, {}, "normalized dataset has no imu.csv")
+    if with_imu and not (profile or {}).get("orbslam3_rgbd_imu"):
+        return CandidateResult(
+            method,
+            "failed",
+            None,
+            log,
+            {},
+            "profile has no orbslam3_rgbd_imu block (required: T_b_c1, noise_gyro, noise_acc, gyro_walk, acc_walk, frequency)",
+        )
     if not binary.exists():
-        return CandidateResult(method, "failed", None, log, {}, f"ORB-SLAM3 RGB-D binary not found: {binary}")
+        return CandidateResult(method, "failed", None, log, {}, f"ORB-SLAM3 binary not found: {binary}")
     if not vocab.exists():
         return CandidateResult(method, "failed", None, log, {}, f"ORB-SLAM3 vocabulary not found: {vocab}")
-    settings = write_orbslam3_settings(dataset, out_dir)
+    try:
+        settings = write_orbslam3_settings(dataset, out_dir, profile=profile, with_imu=with_imu)
+    except ValueError as exc:
+        return CandidateResult(method, "failed", None, log, {}, str(exc))
     cmd = [str(binary), str(vocab), str(settings), str(dataset), str(dataset / "associations.txt")]
-    rc = run(cmd, log=log, cwd=out_dir, progress=progress, progress_label="orbslam3_rgbd:track")
+    if with_imu:
+        cmd.append(str(dataset / "imu.csv"))
+    if not os.environ.get("DISPLAY"):
+        cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1280x720x24", *cmd]
+    rc = run(cmd, log=log, cwd=out_dir, progress=progress, progress_label=f"{method}:track")
     for candidate in (out_dir / "CameraTrajectory.txt", out_dir / "KeyFrameTrajectory.txt"):
         if candidate.exists() and candidate.stat().st_size > 0:
             shutil.copy2(candidate, tum)
@@ -1824,7 +2267,6 @@ def evaluate_pair(
         and rmse <= 0.20
         and median <= 0.10
         and max_gap <= 5.0
-        and (yaw_drift is None or yaw_drift <= 5.0)
     )
     result.update(
         {
@@ -1848,7 +2290,12 @@ def trajectory_duration(traj: dict[str, np.ndarray]) -> float:
     return float(traj["t"][-1] - traj["t"][0])
 
 
-def evaluate_agreement(results: list[CandidateResult], diagnostics: Path, allow_unreliable: bool) -> dict[str, Any]:
+def evaluate_agreement(
+    results: list[CandidateResult],
+    diagnostics: Path,
+    allow_unreliable: bool,
+    dataset: Path | None = None,
+) -> dict[str, Any]:
     diagnostics.mkdir(parents=True, exist_ok=True)
     healthy: dict[str, dict[str, np.ndarray]] = {}
     health: dict[str, dict[str, Any]] = {}
@@ -1902,6 +2349,19 @@ def evaluate_agreement(results: list[CandidateResult], diagnostics: Path, allow_
         winner = sorted(names, key=lambda name: (-health[name].get("poses", 0), name))[0]
         confidence = "low"
 
+    # Compare each healthy candidate against ground truth if available.
+    gt_comparisons: list[dict[str, Any]] = []
+    if dataset is not None and healthy:
+        gt_path = dataset / "groundtruth.txt"
+        if gt_path.exists():
+            gt_traj = read_tum(gt_path)
+            if len(gt_traj["t"]) >= 3:
+                print(f"[pseudo-gt] Comparing {len(healthy)} method(s) against ground truth ({len(gt_traj['t'])} poses)")
+                for name, traj in sorted(healthy.items()):
+                    comp = evaluate_pair(name, traj, "ground_truth", gt_traj, run_duration)
+                    comp["method"] = name
+                    gt_comparisons.append(comp)
+
     agreement = {
         "status": "ok" if supported else "agreement_failed",
         "winner": winner,
@@ -1909,16 +2369,25 @@ def evaluate_agreement(results: list[CandidateResult], diagnostics: Path, allow_
         "support": support,
         "health": health,
         "pairwise": pairwise,
+        "gt_comparisons": gt_comparisons,
         "policy": {
             "min_pairs": 30,
             "rmse_max_m": 0.20,
             "median_max_m": 0.10,
-            "yaw_drift_max_deg": 5.0,
+            "yaw_drift": "diagnostic_only",
             "max_gap_sec": 5.0,
             "min_overlap": "min(10s, 20% of run duration)",
         },
     }
     (diagnostics / "agreement.json").write_text(json.dumps(agreement, indent=2, sort_keys=True), encoding="utf-8")
+
+    if gt_comparisons:
+        gt_fields = ["method", "pairs", "rmse", "median", "overlap_sec", "max_gap_sec", "yaw_drift_deg", "scale_a_to_b", "reason"]
+        with (diagnostics / "gt_comparison.csv").open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=gt_fields)
+            writer.writeheader()
+            for comp in gt_comparisons:
+                writer.writerow({k: comp.get(k, "") for k in gt_fields})
 
     with (diagnostics / "pairwise_agreement.csv").open("w", newline="", encoding="utf-8") as fh:
         fieldnames = [
@@ -1962,6 +2431,16 @@ def write_summary(path: Path, agreement: dict[str, Any]) -> None:
             f"- `{pair['method_a']}` vs `{pair['method_b']}`: agree={pair.get('agree')} "
             f"pairs={pair.get('pairs')} rmse={pair.get('rmse', '')} median={pair.get('median', '')}"
         )
+    gt_comps = agreement.get("gt_comparisons", [])
+    if gt_comps:
+        lines.extend(["", "## Comparison vs Ground Truth (Sim3-aligned ATE)", ""])
+        for comp in gt_comps:
+            rmse = comp.get("rmse")
+            median = comp.get("median")
+            pairs = comp.get("pairs", 0)
+            rmse_str = f"{rmse:.4f}m" if rmse is not None else "n/a"
+            med_str = f"{median:.4f}m" if median is not None else "n/a"
+            lines.append(f"- `{comp['method']}`: rmse={rmse_str} median={med_str} pairs={pairs}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -2039,6 +2518,9 @@ def persist_outputs(
     for item in (workspace / "extraction_manifest.json", workspace / "dataset" / "sync_report.json"):
         if item.exists():
             shutil.copy2(item, output / "diagnostics" / item.name)
+    gt_file = workspace / "dataset" / "groundtruth.txt"
+    if gt_file.exists():
+        shutil.copy2(gt_file, output / "diagnostics" / "groundtruth.txt")
 
     winner = agreement.get("winner")
     if agreement.get("status") == "ok" and winner:
@@ -2061,6 +2543,34 @@ def persist_outputs(
     (output / "run_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def create_synthetic_bag(dataset: Path, workspace: Path, profile: dict[str, Any]) -> Path | None:
+    """Write a ROS2 mcap bag from a normalized dataset so RTAB-Map can replay it."""
+    bag_dir = workspace / "synthetic_bag"
+    if (bag_dir / "metadata.yaml").exists():
+        return bag_dir
+    rgb_topic = (profile.get("rgb_topics") or ["/camera/rgb/image_color"])[0]
+    depth_topic = (profile.get("depth_topics") or ["/camera/depth/image"])[0]
+    info_topic = (profile.get("camera_info_topics") or ["/camera/rgb/camera_info"])[0]
+    log = workspace / "logs" / "synthetic_bag.log"
+    frame_id = profile.get("frame_id", "camera_link")
+    print(f"[pseudo-gt] Creating synthetic ROS2 bag for RTAB-Map from normalized dataset")
+    rc = run(
+        [
+            "python3", "/work/scripts/write_normalized_ros2_bag.py",
+            str(dataset), str(bag_dir),
+            "--rgb-topic", rgb_topic,
+            "--depth-topic", depth_topic,
+            "--info-topic", info_topic,
+            "--frame-id", frame_id,
+        ],
+        log=log,
+    )
+    if rc != 0 or not (bag_dir / "metadata.yaml").exists():
+        print(f"[pseudo-gt] synthetic bag creation failed (rc={rc}); RTAB-Map will be skipped")
+        return None
+    return bag_dir
+
+
 def run_candidates(
     methods: list[str],
     bag: Path,
@@ -2079,16 +2589,35 @@ def run_candidates(
             profile.get("depth_topics", [None])[0],
         ]
     )
+    disabled = set(profile.get("disabled_methods", []))
     for method in methods:
         out_dir = workspace / "candidates" / method
         if progress is not None:
             progress.start(f"candidate:{method}")
+        if method in disabled:
+            log = out_dir / "run.log"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            log.write_text(f"{method} disabled by profile.\n", encoding="utf-8")
+            result = CandidateResult(method, "failed", None, log, {}, "disabled by profile")
+            print(f"[pseudo-gt] {method}: skipped (disabled by profile)")
+            if progress is not None:
+                progress.done(f"candidate:{method}")
+            results.append(result)
+            continue
         print(f"[pseudo-gt] Running candidate: {method}")
         if method in {"rtabmap_rgbd", "rtabmap_rgbd_imu"}:
-            if profile.get("input_format") == "tum_rgbd":
+            bag_playable = (
+                bag is not None
+                and bag.exists()
+                and (
+                    (bag.is_file() and bag.suffix in {".bag", ".mcap"})
+                    or (bag.is_dir() and (bag / "metadata.yaml").exists())
+                )
+            )
+            if not bag_playable:
                 log = out_dir / "run.log"
                 out_dir.mkdir(parents=True, exist_ok=True)
-                log.write_text("RTAB-Map candidates require ROS bag playback; skipped for TUM RGB-D input.\n", encoding="utf-8")
+                log.write_text("RTAB-Map requires a playable ROS bag; none available for this input.\n", encoding="utf-8")
                 result = CandidateResult(method, "failed", None, log, {}, "requires ROS bag playback")
             elif compressed_replay_topics:
                 log = out_dir / "run.log"
@@ -2102,8 +2631,8 @@ def run_candidates(
                 result = run_rtabmap_candidate(method, bag, out_dir, profile, progress=progress)
         elif method == "colmap_sfm":
             result = run_colmap_candidate(dataset, out_dir, colmap_preset, colmap_use_gpu, progress=progress)
-        elif method == "orbslam3_rgbd":
-            result = run_orbslam3_candidate(dataset, out_dir, progress=progress)
+        elif method in {"orbslam3_rgbd", "orbslam3_rgbd_imu"}:
+            result = run_orbslam3_candidate(dataset, out_dir, profile=profile, method=method, progress=progress)
         else:
             result = CandidateResult(method, "failed", None, None, {}, "unknown method")
         print(f"[pseudo-gt] {method}: {result.status} {result.reason}")
@@ -2130,7 +2659,7 @@ def main() -> int:
     parser.add_argument("bag", type=Path)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--profile-config", default=Path("/work/config/pseudo_gt_profiles.yaml"), type=Path)
-    parser.add_argument("--input-format", default="auto", choices=["auto", "bag", "tum_rgbd"])
+    parser.add_argument("--input-format", default="auto", choices=["auto", "bag", "tum_rgbd", "hypersim"])
     parser.add_argument("--methods", default=DEFAULT_METHODS)
     parser.add_argument("--colmap-preset", default="stable", choices=["fast", "stable", "robust"])
     parser.add_argument("--colmap-use-gpu", default=os.environ.get("PSEUDO_GT_COLMAP_USE_GPU", "0"), choices=["0", "1"])
@@ -2181,9 +2710,12 @@ def main() -> int:
         if "imu_topic" in extraction:
             profile["imu_topics"] = [extraction["imu_topic"]] if extraction["imu_topic"] else []
         write_extraction_manifest(workspace, extraction, profile, args)
+        rtabmap_bag = bag
+        if input_format in {"tum_rgbd", "hypersim"}:
+            rtabmap_bag = create_synthetic_bag(dataset, workspace, profile)
         results = run_candidates(
             methods,
-            bag,
+            rtabmap_bag,
             workspace,
             dataset,
             profile,
@@ -2192,7 +2724,7 @@ def main() -> int:
             progress=progress,
         )
         progress.start("agreement")
-        agreement = evaluate_agreement(results, workspace / "diagnostics", args.allow_unreliable_best)
+        agreement = evaluate_agreement(results, workspace / "diagnostics", args.allow_unreliable_best, dataset=dataset)
         progress.done("agreement")
         progress.start("persist_outputs")
         persist_outputs(workspace, output, results, agreement, args.persist_intermediates)

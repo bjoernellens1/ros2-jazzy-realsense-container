@@ -58,6 +58,7 @@ done
 
 ARGS=(
   ros2 run rtabmap_odom rgbd_odometry --ros-args
+  -p use_sim_time:=true
   -p frame_id:="${RTABMAP_FRAME_ID}"
   -p odom_frame_id:="${RTABMAP_ODOM_FRAME_ID}"
   -p publish_tf:=true
