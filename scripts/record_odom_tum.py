@@ -60,20 +60,35 @@ class OdomTumRecorder:
                 ]
             )
 
+        self._first_pos: tuple[float, float, float] | None = None
+        self._has_motion = False
         self.sub = self.node.create_subscription(Odometry, topic, self._on_odom, 200)
         self.timer = self.node.create_timer(1.0, self._on_timer)
 
     def _on_odom(self, msg: Odometry) -> None:
+        # RTAB-Map sets covariance[0] >= 9999 when odometry is lost (quality=0).
+        # Discard these null/identity poses so they don't inflate the trajectory.
+        if msg.pose.covariance[0] >= 9999.0:
+            return
         self.last_msg_wall = self.node.get_clock().now()
         pose = msg.pose.pose
         twist = msg.twist.twist
         ts = stamp_to_sec(msg.header.stamp)
+        x, y, z = pose.position.x, pose.position.y, pose.position.z
+        if self._first_pos is None:
+            self._first_pos = (x, y, z)
+        else:
+            dx = x - self._first_pos[0]
+            dy = y - self._first_pos[1]
+            dz = z - self._first_pos[2]
+            if (dx*dx + dy*dy + dz*dz) > 1e-8:
+                self._has_motion = True
         self.tum_writer.writerow(
             [
                 f"{ts:.9f}",
-                f"{pose.position.x:.9f}",
-                f"{pose.position.y:.9f}",
-                f"{pose.position.z:.9f}",
+                f"{x:.9f}",
+                f"{y:.9f}",
+                f"{z:.9f}",
                 f"{pose.orientation.x:.9f}",
                 f"{pose.orientation.y:.9f}",
                 f"{pose.orientation.z:.9f}",
@@ -157,12 +172,16 @@ def main() -> int:
         pass
     finally:
         count = recorder.count
+        has_motion = recorder._has_motion
         recorder.close()
         if rclpy.ok():
             rclpy.shutdown()
 
     if count == 0:
         return 1
+    if not has_motion:
+        print(f"[odom_recorder] Recorded {count} poses but trajectory has no motion (degenerate).", file=sys.stderr)
+        return 2
     return 0
 
 

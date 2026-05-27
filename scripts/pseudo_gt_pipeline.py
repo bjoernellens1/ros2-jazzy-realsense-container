@@ -3037,11 +3037,13 @@ def persist_outputs(
     results: list[CandidateResult],
     agreement: dict[str, Any],
     persist_intermediates: bool,
+    command: str = "",
 ) -> None:
     (output / "candidates").mkdir(parents=True, exist_ok=True)
     (output / "diagnostics").mkdir(parents=True, exist_ok=True)
     manifest = {
         "workspace": str(workspace),
+        "command": command,
         "results": [
             {
                 "method": r.method,
@@ -3157,6 +3159,7 @@ def write_extraction_manifest(workspace: Path, extraction: dict[str, Any], profi
 
 
 def main() -> int:
+    import datetime
     parser = argparse.ArgumentParser(description="Build a best pseudo-GT trajectory from RGB-D bags or TUM RGB-D sequences.")
     parser.add_argument("bag", type=Path)
     parser.add_argument("--profile", required=True)
@@ -3179,7 +3182,10 @@ def main() -> int:
     bag = args.bag.resolve()
     if not bag.exists():
         raise SystemExit(f"Input bag does not exist: {bag}")
-    output = args.output.resolve()
+    output_base = args.output.resolve()
+    # Append timestamp to output directory to ensure uniqueness
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output = output_base.parent / f"{output_base.name}_{timestamp}"
     methods = parse_methods(args.methods)
     profile = load_profile(args.profile_config, args.profile)
     input_format = detect_input_format(bag, args.input_format, profile)
@@ -3240,7 +3246,20 @@ def main() -> int:
         agreement = evaluate_agreement(results, workspace / "diagnostics", args.allow_unreliable_best, dataset=dataset)
         progress.done("agreement")
         progress.start("persist_outputs")
-        persist_outputs(workspace, output, results, agreement, args.persist_intermediates)
+        # Reconstruct command for reproducibility
+        script_name = Path(sys.argv[0]).name
+        cmd_parts = []
+        for k, v in vars(args).items():
+            if k == "bag" or k == "output":
+                continue
+            flag = f"--{k.replace('_', '-')}"
+            if isinstance(v, bool):
+                if v:
+                    cmd_parts.append(flag)
+            elif v not in (0, None, ""):
+                cmd_parts.append(f"{flag} {v}")
+        cmd = f"python3 {script_name} {' '.join(cmd_parts)} --output {output_base} {args.bag}"
+        persist_outputs(workspace, output, results, agreement, args.persist_intermediates, cmd)
         progress.done("persist_outputs")
         if agreement.get("status") != "ok" and not args.allow_unreliable_best:
             print("[pseudo-gt] Agreement failed; no reliable best_pseudo_gt_tum.csv was written.", file=sys.stderr)

@@ -79,10 +79,20 @@ RUN git clone --depth 1 --branch "${PANGOLIN_REF}" https://github.com/stevenlove
 
 RUN git clone --depth 1 --branch "${ORB_SLAM3_REF}" https://github.com/UZ-SLAMLab/ORB_SLAM3.git /opt/ORB_SLAM3 \
     && sed -i 's/++11/++14/g' /opt/ORB_SLAM3/CMakeLists.txt \
-    && sed -i 's/-Werror//g' /opt/ORB_SLAM3/Thirdparty/Sophus/CMakeLists.txt \
+    && sed -i 's/-Werror//g' /opt/ORB_SLAM3/Thirdparty/Sophus/CMakeLists.txt
+
+COPY tools/orbslam3_rgbd_imu_offline.cc /opt/ORB_SLAM3/Examples/RGB-D-Inertial/orbslam3_rgbd_imu_offline.cc
+
+RUN printf '%s\n' \
+      'set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/Examples/RGB-D-Inertial)' \
+      'add_executable(rgbd_inertial_dataset' \
+      '        Examples/RGB-D-Inertial/orbslam3_rgbd_imu_offline.cc)' \
+      'target_link_libraries(rgbd_inertial_dataset ${PROJECT_NAME})' \
+      >> /opt/ORB_SLAM3/CMakeLists.txt \
     && cd /opt/ORB_SLAM3 \
     && ./build.sh \
     && test -x /opt/ORB_SLAM3/Examples/RGB-D/rgbd_tum \
+    && test -x /opt/ORB_SLAM3/Examples/RGB-D-Inertial/rgbd_inertial_dataset \
     && test -s /opt/ORB_SLAM3/Vocabulary/ORBvoc.txt
 
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc \
@@ -93,6 +103,7 @@ COPY docker/ros_entrypoint.sh /ros_entrypoint.sh
 RUN chmod +x /ros_entrypoint.sh
 
 ENV ORB_SLAM3_RGBD_BIN=/opt/ORB_SLAM3/Examples/RGB-D/rgbd_tum
+ENV ORB_SLAM3_RGBD_IMU_BIN=/opt/ORB_SLAM3/Examples/RGB-D-Inertial/rgbd_inertial_dataset
 ENV ORB_SLAM3_VOCAB=/opt/ORB_SLAM3/Vocabulary/ORBvoc.txt
 
 WORKDIR /work

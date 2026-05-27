@@ -27,6 +27,8 @@ pseudo_gt_smoke/
 _workspace/
 dataset/
 datasets/
+output/*
+!output/.gitkeep
 outputs/
 candidates/
 diagnostics/
@@ -43,6 +45,7 @@ database.db
 **/frames.csv
 **/quality.csv
 **/associations.txt
+**/dataset/imu.csv
 
 # Large derived numerical/geometry/media artifacts
 *.npy

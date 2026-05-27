@@ -189,7 +189,7 @@ RealSense or Orbbec ROS2 MCAP/rosbag2:
 ```bash
 ./scripts/best_pseudo_gt_from_bag.sh \
   --profile orbbec_femto_bolt_ros2 \
-  --methods rtabmap_rgbd,rtabmap_rgbd_imu,colmap_sfm,orbslam3_rgbd \
+  --methods rtabmap_rgbd,rtabmap_rgbd_imu,colmap_sfm,orbslam3_rgbd,orbslam3_rgbd_imu \
   --workspace-mode ram \
   --force \
   /path/to/rosbag2_dir_or_file.mcap
@@ -206,6 +206,11 @@ Raw TUM RGB-D sequence directory:
   --force \
   /path/to/rgbd_dataset_freiburg1_xyz
 ```
+
+RTAB-Map can be selected with `--methods rtabmap_rgbd` and tuned with
+`--rtabmap-preset default|robust|f2f|dense-keyframes`. The offline pipeline
+exports RTAB-Map dense odometry from the database for evaluation; sparse graph
+pose exports are kept only as diagnostics.
 
 CUDA path for NVIDIA machines:
 
@@ -234,6 +239,10 @@ run_manifest.json
 Reliability is agreement-gated. At least two healthy methods must agree with the moderate default gate before `best_pseudo_gt_tum.csv` is written. If no pair agrees, the run exits nonzero, writes diagnostics, and does not call the result reliable. Use `--allow-unreliable-best` only when you explicitly want a low-confidence fallback file named `candidate_best_unreliable_tum.csv`.
 
 For rosbags, extraction first performs one-to-one RGB/depth timestamp association from message header stamps, with bag timestamp fallback only if headers are missing. The default profiles require at least 80% of color frames to associate within `association_max_dt: 0.05`; sync diagnostics are written to `diagnostics/sync_report.json`.
+
+ORB-SLAM3 has separate candidates for RGB-D only (`orbslam3_rgbd`) and RGB-D-inertial (`orbslam3_rgbd_imu`). The inertial candidate requires both `dataset/imu.csv` (generated from `sensor_msgs/Imu` topics during rosbag normalization) and an `orbslam3_rgbd_imu` block in the profile with `T_b_c1`, `noise_gyro`, `noise_acc`, `gyro_walk`, `acc_walk`, and `frequency`. If either is missing, the candidate is skipped with a `failed` status — there is no silent fallback to D435i defaults on other sensors. The shipped RealSense D435i profiles use ORB-SLAM3's sample extrinsics/noise; replace them with calibrated values before treating RGB-D-inertial output as reliable. `Camera.fps` in the emitted settings is derived from the median frame spacing in `associations.txt`, not hardcoded.
+
+Yaw drift is reported as a diagnostic in `pairwise_agreement.csv` but is not a default hard agreement gate. The old hard yaw gate was too brittle for handheld sequences because yaw extracted in each method's arbitrary world frame can differ after roll/pitch-heavy motion even when translational agreement is good.
 
 Every run prints `[progress]` lines with estimated percent complete, elapsed time, and ETA for normalization, each candidate method, agreement scoring, and output persistence. Long external commands also emit periodic progress pulses while the command is still running.
 

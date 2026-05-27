@@ -67,6 +67,19 @@ x-pseudo-gt: &pseudo-gt
     args:
       BASE_IMAGE: localhost/ros2-jazzy-realsense:latest
   shm_size: ${PSEUDO_GT_SHM_SIZE:-32gb}
+  volumes:
+    - /dev:/dev
+    - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    - ${XDG_RUNTIME_DIR:-/tmp}:${XDG_RUNTIME_DIR:-/tmp}:rw
+    - ./bags:/work/bags:rw
+    - ./logs:/work/logs:rw
+    - ./config:/work/config:rw
+    - ./docker:/work/docker:rw
+    - ./rviz:/work/rviz:rw
+    - ./scripts:/work/scripts:rw
+    - ./tests:/work/tests:rw
+    - ./odometry:/work/odometry:rw
+    - ./output:/outputs:rw
 
 x-pseudo-gt-cuda: &pseudo-gt-cuda
   <<: *common
@@ -78,6 +91,19 @@ x-pseudo-gt-cuda: &pseudo-gt-cuda
       ROS_DISTRO: jazzy
   shm_size: ${PSEUDO_GT_SHM_SIZE:-32gb}
   gpus: all
+  volumes:
+    - /dev:/dev
+    - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    - ${XDG_RUNTIME_DIR:-/tmp}:${XDG_RUNTIME_DIR:-/tmp}:rw
+    - ./bags:/work/bags:rw
+    - ./logs:/work/logs:rw
+    - ./config:/work/config:rw
+    - ./docker:/work/docker:rw
+    - ./rviz:/work/rviz:rw
+    - ./scripts:/work/scripts:rw
+    - ./tests:/work/tests:rw
+    - ./odometry:/work/odometry:rw
+    - ./output:/outputs:rw
 
 services:
   shell:

@@ -6,11 +6,13 @@ usage() {
 Usage: best_pseudo_gt_from_bag.sh [--cuda] --profile <profile> [options] <bag-rosbag2-or-tum-dir>
 
 Runs the pseudo-GT pipeline entirely inside Compose containers.
+Outputs default to <repo>/output/<input-stem>_pseudo_gt/ unless --output is given.
 
 Common options passed through:
   --methods <csv>
   --input-format auto|bag|tum_rgbd
   --colmap-preset fast|stable|robust
+  --rtabmap-preset default|robust|f2f|dense-keyframes
   --workspace-mode ram|disk
   --persist-intermediates
   --allow-unreliable-best
@@ -105,7 +107,7 @@ else
 fi
 
 if [[ -z "$OUTPUT" ]]; then
-  OUTPUT="${BAG_PARENT}/${DEFAULT_STEM}_pseudo_gt"
+  OUTPUT="${ROOT_DIR}/output/${DEFAULT_STEM}_pseudo_gt"
 fi
 OUTPUT_ABS="$(realpath -m "$OUTPUT")"
 OUTPUT_PARENT="$(dirname "$OUTPUT_ABS")"
