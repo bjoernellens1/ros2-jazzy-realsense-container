@@ -3258,7 +3258,13 @@ def main() -> int:
                     cmd_parts.append(flag)
             elif v not in (0, None, ""):
                 cmd_parts.append(f"{flag} {v}")
-        cmd = f"python3 {script_name} {' '.join(cmd_parts)} --output {output_base} {args.bag}"
+        python_cmd = f"python3 {script_name} {' '.join(cmd_parts)} --output {output_base} {args.bag}"
+        # If running in container (detected by PYTHONPATH or /work directory), wrap with podman compose
+        in_container = Path("/work").exists() or "ORB_SLAM3" in os.environ.get("PATH", "")
+        if in_container:
+            cmd = f"podman compose run shell {python_cmd}"
+        else:
+            cmd = python_cmd
         persist_outputs(workspace, output, results, agreement, args.persist_intermediates, cmd)
         progress.done("persist_outputs")
         if agreement.get("status") != "ok" and not args.allow_unreliable_best:
