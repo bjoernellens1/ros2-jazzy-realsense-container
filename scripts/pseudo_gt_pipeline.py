@@ -3227,8 +3227,8 @@ def run_candidates(
         if method in {"rtabmap_rgbd", "rtabmap_rgbd_imu"}:
             result = run_rtabmap_candidate(method, dataset, out_dir, profile, rtabmap_preset, progress=progress)
         elif method == "colmap_sfm":
-            # Downsample to 5 fps for COLMAP to speed up SfM on large datasets
-            downsample_dataset_for_colmap(dataset, target_fps=5.0)
+            # Downsample to 3 fps for COLMAP to speed up SfM on large datasets
+            downsample_dataset_for_colmap(dataset, target_fps=3.0)
             result = run_colmap_candidate(dataset, out_dir, colmap_preset, colmap_use_gpu, progress=progress)
         elif method in {"orbslam3_rgbd", "orbslam3_rgbd_imu"}:
             result = run_orbslam3_candidate(dataset, out_dir, profile=profile, method=method, progress=progress)
