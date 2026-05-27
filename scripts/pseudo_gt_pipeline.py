@@ -3175,7 +3175,7 @@ def main() -> int:
     parser.add_argument("--allow-unreliable-best", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-frames", default=0, type=int)
-    parser.add_argument("--target-fps", default=3.0, type=float)
+    parser.add_argument("--target-fps", default=0, type=float, help="Target frame rate for normalization (0=all frames, default)")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
