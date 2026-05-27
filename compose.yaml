@@ -80,6 +80,7 @@ x-pseudo-gt: &pseudo-gt
     - ./tests:/work/tests:rw
     - ./odometry:/work/odometry:rw
     - ./output:/outputs:rw
+    - /mnt/cps_persistent1_shared:/mnt/cps_persistent1_shared:ro
 
 x-pseudo-gt-cuda: &pseudo-gt-cuda
   <<: *common
@@ -104,6 +105,7 @@ x-pseudo-gt-cuda: &pseudo-gt-cuda
     - ./tests:/work/tests:rw
     - ./odometry:/work/odometry:rw
     - ./output:/outputs:rw
+    - /mnt/cps_persistent1_shared:/mnt/cps_persistent1_shared:ro
 
 services:
   shell:
