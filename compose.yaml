@@ -79,7 +79,7 @@ x-pseudo-gt: &pseudo-gt
     - ./scripts:/work/scripts:rw
     - ./tests:/work/tests:rw
     - ./odometry:/work/odometry:rw
-    - ./output:/outputs:rw
+    - ./output:/work/output:rw
     - /mnt/cps_persistent1_shared:/mnt/cps_persistent1_shared:ro
 
 x-pseudo-gt-cuda: &pseudo-gt-cuda
@@ -104,7 +104,7 @@ x-pseudo-gt-cuda: &pseudo-gt-cuda
     - ./scripts:/work/scripts:rw
     - ./tests:/work/tests:rw
     - ./odometry:/work/odometry:rw
-    - ./output:/outputs:rw
+    - ./output:/work/output:rw
     - /mnt/cps_persistent1_shared:/mnt/cps_persistent1_shared:ro
 
 services:
