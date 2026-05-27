@@ -3103,6 +3103,100 @@ def persist_outputs(
 
 
 
+def downsample_dataset_for_colmap(dataset: Path, target_fps: float = 5.0) -> None:
+    """Downsample images and depth to target_fps by deleting unwanted frames.
+    Updates association files to match the remaining frames.
+    Used to speed up COLMAP on large datasets."""
+    images_dir = dataset / "images"
+    depth_dir = dataset / "depth"
+    if not images_dir.exists():
+        return  # Nothing to downsample
+
+    # Read rgb.txt to get timestamps
+    rgb_file = dataset / "rgb.txt"
+    if not rgb_file.exists():
+        return
+
+    rgb_entries = []
+    with rgb_file.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                ts = float(parts[0])
+                path = parts[1]
+                rgb_entries.append((ts, path))
+
+    if not rgb_entries:
+        return
+
+    # Keep frames at target_fps intervals
+    min_dt = 1.0 / target_fps if target_fps > 0 else 0.0
+    keep_indices = set()
+    last_ts = -float('inf')
+    for i, (ts, _) in enumerate(rgb_entries):
+        if ts - last_ts >= min_dt * 0.99:  # 0.99 to handle floating point
+            keep_indices.add(i)
+            last_ts = ts
+
+    # Delete unwanted images and depth
+    for i, (ts, rgb_path) in enumerate(rgb_entries):
+        if i not in keep_indices:
+            img_file = dataset / rgb_path
+            if img_file.exists():
+                img_file.unlink()
+            # Find corresponding depth file
+            depth_path = rgb_path.replace("images/", "depth/")
+            depth_file = dataset / depth_path
+            if depth_file.exists():
+                depth_file.unlink()
+
+    # Rewrite association files to only include kept frames
+    with rgb_file.open("w") as f:
+        for i, (ts, rgb_path) in enumerate(rgb_entries):
+            if i in keep_indices:
+                f.write(f"{ts:.9f} {rgb_path}\n")
+
+    depth_file = dataset / "depth.txt"
+    if depth_file.exists():
+        depth_entries = []
+        with depth_file.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    ts = float(parts[0])
+                    path = parts[1]
+                    depth_entries.append((ts, path))
+
+        with depth_file.open("w") as f:
+            for i, (ts, depth_path) in enumerate(depth_entries):
+                if i in keep_indices:
+                    f.write(f"{ts:.9f} {depth_path}\n")
+
+    assoc_file = dataset / "associations.txt"
+    if assoc_file.exists():
+        assoc_entries = []
+        with assoc_file.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 4:
+                    rgb_ts = float(parts[0])
+                    assoc_entries.append((rgb_ts, line))
+
+        with assoc_file.open("w") as f:
+            for i, (rgb_ts, line) in enumerate(assoc_entries):
+                if i in keep_indices:
+                    f.write(line + "\n")
+
+
 def run_candidates(
     methods: list[str],
     dataset: Path,
@@ -3133,6 +3227,8 @@ def run_candidates(
         if method in {"rtabmap_rgbd", "rtabmap_rgbd_imu"}:
             result = run_rtabmap_candidate(method, dataset, out_dir, profile, rtabmap_preset, progress=progress)
         elif method == "colmap_sfm":
+            # Downsample to 5 fps for COLMAP to speed up SfM on large datasets
+            downsample_dataset_for_colmap(dataset, target_fps=5.0)
             result = run_colmap_candidate(dataset, out_dir, colmap_preset, colmap_use_gpu, progress=progress)
         elif method in {"orbslam3_rgbd", "orbslam3_rgbd_imu"}:
             result = run_orbslam3_candidate(dataset, out_dir, profile=profile, method=method, progress=progress)
